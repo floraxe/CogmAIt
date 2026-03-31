@@ -1,73 +1,94 @@
-# Web框架
+# Web框架核心
 fastapi
 uvicorn[standard]
-pydantic
+pydantic>=2.11.7
 python-multipart
 starlette
 httpx
+sse-starlette
 
 # 数据库
 sqlalchemy
-alembic
-psycopg2-binary
 pymysql
+mysql-connector-python
 
-# 工具库
-python-jose[cryptography]==3.3.0
-passlib[bcrypt]==1.7.4
-bcrypt
-pyyaml
-python-dotenv==1.0.0
+# 安全认证
+python-jose[cryptography]
+passlib[bcrypt]
 email-validator
 
-# 文件处理
-modelscope
-watchdog
-cachetools
-anthropic
-magic_pdf
-
-# 异步支持
+# 异步和文件
 aiohttp
-aiofiles==23.2.1
+aiofiles
+python-dotenv
+pyyaml
 
 # 日志
 loguru
 
-# 向量数据库支持
-faiss-cpu
-sentence-transformers
-scikit-learn
-numpy
-torch
+# AI提供商
+anthropic
+google-generativeai
 
-# 知识库向量化支持
-langchain>=0.1.0
-langchain-community>=0.0.13
-langchain-openai>=0.0.5
-langchain-text-splitters>=0.0.1
-
-# 向量库
-pymilvus
-
-# 新增依赖
-pillow==10.0.0
-pandas
-openpyxl==3.1.2
-python-docx==1.0.1
-pypdf==3.15.5
+# 知识图谱
 neo4j
-neo4j-graphrag==1.3.0
+neo4j-graphrag>=1.0.0
+
+# 文本处理
+langchain-text-splitters
+
+# 数据处理
+pandas
+numpy
+
+# 文件和对象存储
 minio>=7.2.0
 
+# 数据库异步支持
 asyncpg
 aiomysql
 
+# 工具服务
+fastmcp>=0.1.0
 tavily-python
 
-# MCP服务支持
-fastmcp>=0.1.0
-mysql-connector-python
-google-genai
-google-generativeai
-mineru[core]
+# ==========================================
+# 以下为可选依赖（注释掉，需要时再安装）
+# ==========================================
+
+# 向量搜索（大约1GB+，需要时再装）
+# faiss-cpu
+# sentence-transformers
+# torch
+# scikit-learn
+
+# 向量数据库（可选）
+# pymilvus
+
+# 本地模型支持（复杂，需要时再装）
+# modelscope
+
+# PDF高级处理（Windows安装困难，需要时再装）
+# magic_pdf
+# mineru[core]
+
+# PostgreSQL支持（如果不用PG数据库）
+# psycopg2-binary
+
+# 其他工具
+# watchdog
+# cachetools
+# pillow
+# openpyxl
+# python-docx
+# pypdf
+
+# 数据库迁移工具（项目未使用）
+# alembic
+
+# 旧依赖包（已不需要）
+# bcrypt  # passlib已包含
+# langchain  # 只用langchain-text-splitters
+# langchain-community
+# langchain-openai
+# google-genai  # 用google-generativeai即可
