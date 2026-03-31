@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from dotenv import load_dotenv
+load_dotenv()  # 自动加载项目根目录的 .env 文件
 import os
 import sys
 import json

@@ -1,8 +1,18 @@
 import time
 from typing import Dict, Any, Optional, List, Union, AsyncGenerator
-from modelscope import AutoModelForCausalLM, AutoTokenizer
-import torch
+import logging
 from app.providers.base import ModelProvider
+
+# modelscope和torch为可选依赖
+try:
+    from modelscope import AutoModelForCausalLM, AutoTokenizer
+    import torch
+    MODELSCOPE_AVAILABLE = True
+except ImportError:
+    MODELSCOPE_AVAILABLE = False
+    logging.warning("modelscope未安装，本地模型功能不可用")
+
+logger = logging.getLogger(__name__)
 
 class LocalProvider(ModelProvider):
     """
@@ -43,6 +53,9 @@ class LocalProvider(ModelProvider):
     
     async def test_connection(self, api_key: str, base_url: Optional[str] = None) -> Dict[str, Any]:
         """测试模型加载能力"""
+        if not MODELSCOPE_AVAILABLE:
+            return {"success": False, "error": "modelscope未安装，无法使用本地模型"}
+        
         try:
             start_time = time.time()
             model_name = base_url or ""
@@ -87,6 +100,13 @@ class LocalProvider(ModelProvider):
         **kwargs
     ) -> Union[Dict[str, Any], AsyncGenerator[Dict[str, Any], None]]:
         """聊天补全接口"""
+        if not MODELSCOPE_AVAILABLE:
+            if stream:
+                async def error_stream():
+                    yield {"status": "error", "message": "modelscope未安装"}
+                return error_stream()
+            return {"status": "error", "message": "modelscope未安装"}
+        
         if stream:
             async def error_stream():
                 yield {"status": "error", "message": "本地模型暂不支持流式输出"}
@@ -174,6 +194,13 @@ class LocalProvider(ModelProvider):
         **kwargs
     ) -> Union[Dict[str, Any], AsyncGenerator[Dict[str, Any], None]]:
         """文本补全接口"""
+        if not MODELSCOPE_AVAILABLE:
+            if stream:
+                async def error_stream():
+                    yield {"status": "error", "message": "modelscope未安装"}
+                return error_stream()
+            return {"status": "error", "message": "modelscope未安装"}
+        
         if stream:
             async def error_stream():
                 yield {"status": "error", "message": "本地模型暂不支持流式输出"}
