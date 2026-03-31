@@ -49,9 +49,10 @@ class Settings(BaseSettings):
     # 数据库设置
     DB_HOST: str = "localhost"
     DB_PORT: str = "3306"
-    DB_USER: str = "xkk"
+    DB_USER: str = "root"
     DB_PASSWORD: str = "xkkxkkxkk"
     DB_NAME: str = "cogmait"
+    DB_DATABASE: str = "cogmait"
     
     # 默认使用MySQL数据库
     DATABASE_URI: Optional[str] = None
@@ -73,6 +74,13 @@ class Settings(BaseSettings):
     # 模型供应商设置
     OPENAI_API_KEY: Optional[str] = None
     ANTHROPIC_API_KEY: Optional[str] = None
+    
+    # PDF OCR服务配置
+    OCR_SPACE_API_KEY: Optional[str] = None
+    
+    # Pinecone向量数据库配置
+    PINECONE_API_KEY: Optional[str] = None
+    PINECONE_ENVIRONMENT: Optional[str] = "us-east-1"
     
     # 模型路径设置
     PROVIDERS_PACKAGE: str = "app.providers"

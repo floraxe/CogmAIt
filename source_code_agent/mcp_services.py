@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 # 数据库连接配置
 DB_CONFIG = {
     'host': os.environ.get('DB_HOST', 'localhost'),
-    'user': os.environ.get('DB_USER', 'xkk'),
+    'user': os.environ.get('DB_USER', 'root'),
     'password': os.environ.get('DB_PASSWORD', 'xkkxkkxkk'),
     'database': os.environ.get('DB_DATABASE', 'cogmait')
 }

@@ -6,6 +6,17 @@ import numpy as np
 from pathlib import Path
 import ast
 from sqlalchemy.orm import Session
+import asyncio
+
+# Pinecone向量数据库
+try:
+    from pinecone import Pinecone, ServerlessSpec
+    HAS_PINECONE = True
+except ImportError:
+    HAS_PINECONE = False
+    logging.warning("pinecone 模块导入失败，使用Pinecone功能请安装: poetry add pinecone")
+
+# Milvus（保留兼容）
 try:
     from pymilvus import MilvusClient
     HAS_PYMILVUS = True
@@ -13,8 +24,8 @@ except ImportError:
     HAS_PYMILVUS = False
     logging.warning("pymilvus 模块导入失败，向量存储功能将不可用。请使用 pip install pymilvus 安装。")
 
-# 将 HAS_PYMILVUS 导出为模块变量，确保它可以被其他模块导入
-__all__ = ['MilvusVectorStore', 'EmbeddingManager', 'HAS_PYMILVUS']
+# 将模块变量导出
+__all__ = ['MilvusVectorStore', 'PineconeVectorStore', 'EmbeddingManager', 'HAS_PYMILVUS', 'HAS_PINECONE']
 
 from app.models.model import Model
 from app.utils.model import get_model
@@ -24,6 +35,24 @@ from app.core.config import settings
 
 # 配置日志
 logger = logging.getLogger(__name__)
+
+# 延迟导入settings以避免循环导入
+def get_api_keys():
+    """获取API密钥配置"""
+    try:
+        from app.core.config import settings
+        return {
+            'openai': settings.OPENAI_API_KEY or "",
+            'pinecone': settings.PINECONE_API_KEY or "",
+            'pinecone_env': settings.PINECONE_ENVIRONMENT or "us-east-1"
+        }
+    except Exception as e:
+        logger.warning(f"获取配置失败，使用默认值: {e}")
+        return {
+            'openai': os.environ.get("OPENAI_API_KEY", ""),
+            'pinecone': os.environ.get("PINECONE_API_KEY", ""),
+            'pinecone_env': os.environ.get("PINECONE_ENVIRONMENT", "us-east-1")
+        }
 
 
 class MilvusVectorStore:
@@ -286,6 +315,179 @@ class MilvusVectorStore:
         except Exception as e:
             logger.error(f"搜索相似向量失败: {str(e)}")
             return []
+
+
+class PineconeVectorStore:
+    """
+    Pinecone云向量数据库存储类（替代本地FAISS/Milvus）
+    """
+    
+    def __init__(self, index_name_prefix: str = "knowledge-"):
+        """初始化Pinecone向量存储"""
+        self.index_name_prefix = index_name_prefix
+        self.pc = None
+        
+        if not HAS_PINECONE:
+            logger.warning("Pinecone未安装，请使用: pip install pinecone-client")
+            return
+        
+        # 获取API密钥
+        api_keys = get_api_keys()
+        pinecone_key = api_keys.get('pinecone', '')
+        
+        if not pinecone_key:
+            logger.warning("未配置PINECONE_API_KEY")
+            return
+        
+        try:
+            self.pc = Pinecone(api_key=pinecone_key)
+            logger.info("成功初始化Pinecone客户端")
+        except Exception as e:
+            logger.error(f"初始化Pinecone失败: {e}")
+    
+    def get_index_name(self, knowledge_id: str) -> str:
+        """获取知识库对应的索引名称"""
+        # Pinecone索引名只能包含小写字母、数字和连字符
+        return f"{self.index_name_prefix}{knowledge_id}".lower()
+    
+    def create_index(self, knowledge_id: str, dimension: int = 1536):
+        """创建Pinecone索引"""
+        if not self.pc:
+            return False
+            
+        try:
+            index_name = self.get_index_name(knowledge_id)
+            
+            # 检查索引是否已存在
+            existing_indexes = self.pc.list_indexes()
+            if index_name in [idx['name'] for idx in existing_indexes]:
+                logger.info(f"Pinecone索引已存在: {index_name}")
+                return True
+            
+            # 创建新索引（使用Serverless）
+            self.pc.create_index(
+                name=index_name,
+                dimension=dimension,
+                metric='cosine',
+                spec=ServerlessSpec(cloud='aws', region='us-east-1')
+            )
+            logger.info(f"成功创建Pinecone索引: {index_name}")
+            return True
+        except Exception as e:
+            logger.error(f"创建Pinecone索引失败: {e}")
+            return False
+    
+    def insert_vectors(self, knowledge_id: str, file_id: str, chunks: List[Dict], embeddings: List[List[float]]):
+        """插入向量到Pinecone"""
+        if not self.pc:
+            return False
+            
+        try:
+            index_name = self.get_index_name(knowledge_id)
+            index = self.pc.Index(index_name)
+            
+            # 准备数据
+            vectors = []
+            for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+                vectors.append({
+                    "id": f"{file_id}_{i}",
+                    "values": embedding,
+                    "metadata": {
+                        "text": chunk["text"][:1000],  # Pinecone元数据限制
+                        "file_id": file_id,
+                        "chunk_index": i,
+                        "knowledge_id": knowledge_id
+                    }
+                })
+            
+            # 分批插入（Pinecone限制每次100条）
+            batch_size = 100
+            for i in range(0, len(vectors), batch_size):
+                batch = vectors[i:i + batch_size]
+                index.upsert(vectors=batch)
+            
+            logger.info(f"成功插入{len(vectors)}个向量到Pinecone")
+            return True
+        except Exception as e:
+            logger.error(f"插入向量到Pinecone失败: {e}")
+            return False
+    
+    def search(self, knowledge_id: str, query_embedding: List[float], top_k: int = 5):
+        """在Pinecone中搜索相似向量"""
+        if not self.pc:
+            return []
+            
+        try:
+            index_name = self.get_index_name(knowledge_id)
+            index = self.pc.Index(index_name)
+            
+            results = index.query(
+                vector=query_embedding,
+                top_k=top_k,
+                include_metadata=True
+            )
+            
+            return [
+                {
+                    "text": match['metadata'].get('text', ''),
+                    "score": match['score'],
+                    "file_id": match['metadata'].get('file_id', ''),
+                    "chunk_index": match['metadata'].get('chunk_index', 0)
+                }
+                for match in results.get('matches', [])
+            ]
+        except Exception as e:
+            logger.error(f"Pinecone搜索失败: {e}")
+            return []
+
+
+async def get_embeddings_openai(texts: List[str], model: str = "text-embedding-3-small") -> List[List[float]]:
+    """
+    使用OpenAI Embeddings API获取文本向量（替代本地sentence-transformers）
+    
+    Args:
+        texts: 文本列表
+        model: 嵌入模型名称
+        
+    Returns:
+        向量列表
+    """
+    # 获取API密钥
+    api_keys = get_api_keys()
+    openai_key = api_keys.get('openai', '')
+    
+    if not openai_key:
+        logger.error("未配置OPENAI_API_KEY")
+        return []
+    
+    try:
+        import httpx
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                "https://api.openai.com/v1/embeddings",
+                headers={
+                    "Authorization": f"Bearer {openai_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": model,
+                    "input": texts
+                }
+            )
+            
+            if response.status_code != 200:
+                logger.error(f"OpenAI API错误: {response.status_code} - {response.text}")
+                return []
+            
+            result = response.json()
+            embeddings = [item["embedding"] for item in result["data"]]
+            logger.info(f"成功获取{len(embeddings)}个向量，维度: {len(embeddings[0])}")
+            return embeddings
+            
+    except Exception as e:
+        logger.error(f"OpenAI嵌入API调用失败: {e}")
+        return []
 
 
 class EmbeddingManager:
