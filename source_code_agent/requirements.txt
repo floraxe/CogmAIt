@@ -27,6 +27,7 @@ pyyaml
 loguru
 
 # AI提供商
+openai
 anthropic
 google-generativeai
 
@@ -40,6 +41,12 @@ langchain-text-splitters
 # 数据处理
 pandas
 numpy
+
+# PDF处理（轻量级）
+pypdf2
+
+# 向量数据库云服务
+pinecone
 
 # 文件和对象存储
 minio>=7.2.0

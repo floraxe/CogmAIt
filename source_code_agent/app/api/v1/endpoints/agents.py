@@ -6,7 +6,11 @@ import time
 import json
 import traceback  # 确保导入 traceback 模块
 import asyncio
+import logging
 from sse_starlette.sse import EventSourceResponse
+
+# 配置日志
+logger = logging.getLogger(__name__)
 from app.utils.embedding import EmbeddingManager
 from app.utils.model import execute_model_inference
 from app.utils.knowledge import get_knowledge
@@ -249,8 +253,8 @@ async def chat_with_agent(
     与智能体对话
     """
     # 添加调试输出
-    print(f"chat_with_agent接收到的请求: agent_id={agent_id}, user_id={user_id}")
-    print(f"file_ids字段值: {chat_request.file_ids}")
+    logger.debug(f"chat_with_agent接收到的请求: agent_id={agent_id}, user_id={user_id}")
+    logger.debug(f"file_ids字段值: {chat_request.file_ids}")
     
     # 验证访问权限
     agent = None
@@ -303,7 +307,7 @@ async def chat_with_agent(
             session_id = chat_request.session_id or f"session_{int(time.time())}"
             config_override = chat_request.config or {}
             file_ids = chat_request.file_ids or []  # 获取文件ID列表
-            print(f"从chat_request提取的file_ids: {file_ids}")
+            logger.debug(f"从chat_request提取的file_ids: {file_ids}")
             
             # 重新从数据库获取agent对象，确保它绑定到当前会话
             agent = agent_utils.get_agent(db, agent_id)
@@ -362,7 +366,7 @@ async def chat_with_agent(
             
             # 处理上传的文件
             if file_ids and len(file_ids) > 0:
-                print(f"开始处理文件，文件ID列表: {file_ids}")
+                logger.info(f"开始处理文件，文件ID列表: {file_ids}")
                 yield {"event": "status", "data": json.dumps({"object": "chat.completion.status", "status": "正在处理上传文件"}, ensure_ascii=False)}
                 time.sleep(0.1)
                 
@@ -375,14 +379,14 @@ async def chat_with_agent(
                     try:
                         # 从数据库获取文件记录
                         file = db.query(FileModel).filter(FileModel.id == file_id).first()
-                        print(f"处理文件ID: {file_id}, 文件存在: {file is not None}")
+                        logger.debug(f"处理文件ID: {file_id}, 文件存在: {file is not None}")
                         if not file:
                             yield {"event": "file_processing", "data": json.dumps({"status": f"文件不存在: {file_id}"}, ensure_ascii=False)}
                             time.sleep(0.1)
                             continue
                         
                         # 检查文件状态
-                        print(f"文件状态: {file.status}, 文件名: {file.original_filename}, 文件类型: {file.file_type}")
+                        logger.debug(f"文件状态: {file.status}, 文件名: {file.original_filename}, 文件类型: {file.file_type}")
                         if file.status != "processed":
                             if file.status == "processing":
                                 yield {"event": "file_processing", "data": json.dumps({"status": f"文件 {file.original_filename} 正在处理中，请稍后再试"}, ensure_ascii=False)}
@@ -396,7 +400,7 @@ async def chat_with_agent(
                         if file.text_content:
                             # 如果数据库中已有提取的文本内容，直接使用
                             file_content = file.text_content
-                            print(f"从数据库获取文件内容，长度: {len(file_content)}")
+                            logger.debug(f"从数据库获取文件内容，长度: {len(file_content)}")
                         else:
                             # 尝试从MinIO获取文件内容
                             from app.core.minio_client import get_file_stream, RAW_BUCKET
@@ -465,7 +469,7 @@ async def chat_with_agent(
                 # 如果成功处理了文件，将文件内容添加到对话中
                 if processed_file_contents:
                     combined_content = "\n".join(processed_file_contents)
-                    print(f"成功处理文件内容，总长度: {len(combined_content)}")
+                    logger.info(f"成功处理文件内容，总长度: {len(combined_content)}")
                     
                     # 添加系统消息，包含文件内容，放在消息列表的最前面
                     file_context_message = {
