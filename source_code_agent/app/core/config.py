@@ -12,8 +12,8 @@ class Settings(BaseSettings):
     API_V1_STR: str = "/api"
     PROJECT_NAME: str = "CogmAIt"
     
-    # 安全设置
-    SECRET_KEY: str = Field(default_factory=lambda: secrets.token_urlsafe(32))
+    # 安全设置（限制在72字节以内）
+    SECRET_KEY: str = Field(default_factory=lambda: secrets.token_urlsafe(32)[:72])
     # 60 分钟 * 24 小时 * 8 天 = 8 天
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 8
     
