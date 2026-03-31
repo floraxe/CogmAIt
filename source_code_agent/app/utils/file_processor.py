@@ -11,11 +11,19 @@ from datetime import datetime
 import uuid
 import pandas as pd
 import uuid
-from magic_pdf.data.data_reader_writer import FileBasedDataWriter, FileBasedDataReader
-from magic_pdf.data.dataset import PymuDocDataset
-from magic_pdf.model.doc_analyze_by_custom_model import doc_analyze
-from magic_pdf.config.enums import SupportedPdfParseMethod
-from magic_pdf.data.read_api import read_local_office, read_local_images
+
+# magic_pdf是可选依赖，如果未安装则使用基础功能
+try:
+    from magic_pdf.data.data_reader_writer import FileBasedDataWriter, FileBasedDataReader
+    from magic_pdf.data.dataset import PymuDocDataset
+    from magic_pdf.model.doc_analyze_by_custom_model import doc_analyze
+    from magic_pdf.config.enums import SupportedPdfParseMethod
+    from magic_pdf.data.read_api import read_local_office, read_local_images
+    MAGIC_PDF_AVAILABLE = True
+except ImportError:
+    MAGIC_PDF_AVAILABLE = False
+    logger = logging.getLogger(__name__)
+    logger.warning("magic_pdf未安装，PDF高级处理功能将不可用")
 
 # 配置日志
 logger = logging.getLogger(__name__)
