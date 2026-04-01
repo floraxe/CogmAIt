@@ -50,7 +50,7 @@ class Settings(BaseSettings):
     DB_HOST: str = "localhost"
     DB_PORT: str = "3306"
     DB_USER: str = "root"
-    DB_PASSWORD: str = "xkkxkkxkk"
+    DB_PASSWORD: str = "qxy113872005"
     DB_NAME: str = "cogmait"
     DB_DATABASE: str = "cogmait"
     
@@ -87,8 +87,8 @@ class Settings(BaseSettings):
     
     # MinIO配置
     MINIO_ENDPOINT: str = "localhost:9000"
-    MINIO_ACCESS_KEY: str = "xkk"
-    MINIO_SECRET_KEY: str = "xkkxkkxkk"
+    MINIO_ACCESS_KEY: str = "minioadmin"
+    MINIO_SECRET_KEY: str = "minioadmin"
     MINIO_SECURE: bool = False
     
     class Config:
