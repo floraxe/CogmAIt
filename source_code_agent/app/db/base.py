@@ -1,5 +1,6 @@
 # ✅ 1. 补全datetime相关导入：解决timezone、timedelta未定义的NameError
 from datetime import datetime, timedelta, timezone
+from typing import Callable
 
 # ✅ 2. SQLAlchemy 2.0 标准导入（已修复MovedIn20Warning）
 from sqlalchemy.orm import declarative_base
@@ -13,10 +14,25 @@ from app.core.config import settings
 # 定义东八区区时（中国标准时间 UTC+8），代码完全不变
 CST_TIMEZONE = timezone(timedelta(hours=8))
 
+# 默认时间提供器：保持原行为（返回当前东八区时间）
+_time_provider: Callable[[], datetime] = lambda: datetime.now(CST_TIMEZONE)
+
+
+def set_time_provider(provider: Callable[[], datetime]) -> None:
+    """设置时间提供器（测试可注入）。"""
+    global _time_provider
+    _time_provider = provider
+
+
+def reset_time_provider() -> None:
+    """重置为默认时间提供器。"""
+    global _time_provider
+    _time_provider = lambda: datetime.now(CST_TIMEZONE)
+
 # 创建获取中国标准时间的函数，代码完全不变
 def get_cn_datetime():
     """获取当前的中国标准时间(东八区，UTC+8)"""
-    return datetime.now(CST_TIMEZONE)
+    return _time_provider()
 
 
 # 创建数据库引擎，代码完全不变
