@@ -1,7 +1,7 @@
 import os
 from unittest.mock import patch, mock_open
 
-from source_code_agent import run
+import run
 
 
 def test_resolve_config_path_prefers_existing_env_path(tmp_path):

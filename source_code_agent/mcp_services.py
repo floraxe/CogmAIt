@@ -22,13 +22,26 @@ from mysql.connector import Error
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# 提取为纯函数，便于测试；默认行为与原实现一致
+def build_mcp_db_config(env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    source = env if env is not None else os.environ
+    return {
+        "host": source.get("DB_HOST", "localhost"),
+        "user": source.get("DB_USER", "root"),
+        "password": source.get("DB_PASSWORD", "xkkxkkxkk"),
+        "database": source.get("DB_DATABASE", "cogmait"),
+    }
+
+
+def resolve_mcp_server_bind(env: Optional[Dict[str, str]] = None) -> tuple[str, int]:
+    source = env if env is not None else os.environ
+    host = source.get("MCP_HOST", "0.0.0.0")
+    port = int(source.get("MCP_PORT", 8001))
+    return host, port
+
+
 # 数据库连接配置
-DB_CONFIG = {
-    'host': os.environ.get('DB_HOST', 'localhost'),
-    'user': os.environ.get('DB_USER', 'root'),
-    'password': os.environ.get('DB_PASSWORD', 'xkkxkkxkk'),
-    'database': os.environ.get('DB_DATABASE', 'cogmait')
-}
+DB_CONFIG = build_mcp_db_config()
 
 # 创建FastAPI应用
 app = FastAPI(title="CogmaitMCP", description="Cogmait模型上下文协议服务")
@@ -798,8 +811,7 @@ async def start():
     
     # 启动FastAPI服务器
     import uvicorn
-    port = int(os.environ.get("MCP_PORT", 8001))
-    host = os.environ.get("MCP_HOST", "0.0.0.0")
+    host, port = resolve_mcp_server_bind()
     logger.info(f"启动MCP服务器 - 监听 {host}:{port}")
     
     # 使用uvicorn启动服务
