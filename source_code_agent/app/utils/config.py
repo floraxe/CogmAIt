@@ -4,7 +4,7 @@
 import os
 import json
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Mapping, Callable
 
 # 配置日志
 logger = logging.getLogger(__name__)
@@ -29,6 +29,59 @@ DEFAULT_CONFIG = {
 # 全局配置对象
 _config = None
 
+
+class _ConfigLoader:
+    """配置加载器：提取可测试的文件读取/默认值补全/环境覆盖逻辑。"""
+
+    def __init__(
+        self,
+        config_path: str,
+        default_config: Dict[str, Any],
+        environ: Mapping[str, str],
+        path_exists: Optional[Callable[[str], bool]] = None,
+        open_fn: Optional[Callable] = None,
+    ) -> None:
+        self.config_path = config_path
+        self.default_config = default_config
+        self.environ = environ
+        self.path_exists = path_exists or os.path.exists
+        self.open_fn = open_fn or open
+
+    def load(self) -> Dict[str, Any]:
+        if self.path_exists(self.config_path):
+            try:
+                with self.open_fn(self.config_path, "r", encoding="utf-8") as f:
+                    config = json.load(f)
+                self._merge_defaults(config)
+                return config
+            except Exception as e:
+                logger.error(f"加载配置文件失败: {str(e)}")
+
+        config = self.default_config.copy()
+        self._apply_env_overrides(config)
+        return config
+
+    def _merge_defaults(self, config: Dict[str, Any]) -> None:
+        for key, value in self.default_config.items():
+            if key not in config:
+                config[key] = value
+            elif isinstance(value, dict):
+                for sub_key, sub_value in value.items():
+                    if sub_key not in config[key]:
+                        config[key][sub_key] = sub_value
+
+    def _apply_env_overrides(self, config: Dict[str, Any]) -> None:
+        if "NEO4J_URI" in self.environ:
+            config["neo4j"]["uri"] = self.environ["NEO4J_URI"]
+        if "NEO4J_USERNAME" in self.environ:
+            config["neo4j"]["username"] = self.environ["NEO4J_USERNAME"]
+        if "NEO4J_PASSWORD" in self.environ:
+            config["neo4j"]["password"] = self.environ["NEO4J_PASSWORD"]
+        if "NEO4J_DATABASE" in self.environ:
+            config["neo4j"]["database"] = self.environ["NEO4J_DATABASE"]
+        if "OPENAI_API_KEY" in self.environ:
+            config["openai"]["api_key"] = self.environ["OPENAI_API_KEY"]
+
 def load_config() -> Dict[str, Any]:
     """
     加载配置文件
@@ -41,43 +94,12 @@ def load_config() -> Dict[str, Any]:
     if _config is not None:
         return _config
     
-    # 检查配置文件是否存在
-    if os.path.exists(CONFIG_PATH):
-        try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                config = json.load(f)
-                
-            # 确保配置包含所有必要的键
-            for key, value in DEFAULT_CONFIG.items():
-                if key not in config:
-                    config[key] = value
-                elif isinstance(value, dict):
-                    for sub_key, sub_value in value.items():
-                        if sub_key not in config[key]:
-                            config[key][sub_key] = sub_value
-            
-            _config = config
-            return config
-            
-        except Exception as e:
-            logger.error(f"加载配置文件失败: {str(e)}")
-    
-    # 如果配置文件不存在或者读取失败，使用默认配置
-    _config = DEFAULT_CONFIG.copy()
-    
-    # 尝试从环境变量读取配置
-    if "NEO4J_URI" in os.environ:
-        _config["neo4j"]["uri"] = os.environ["NEO4J_URI"]
-    if "NEO4J_USERNAME" in os.environ:
-        _config["neo4j"]["username"] = os.environ["NEO4J_USERNAME"]
-    if "NEO4J_PASSWORD" in os.environ:
-        _config["neo4j"]["password"] = os.environ["NEO4J_PASSWORD"]
-    if "NEO4J_DATABASE" in os.environ:
-        _config["neo4j"]["database"] = os.environ["NEO4J_DATABASE"]
-    
-    if "OPENAI_API_KEY" in os.environ:
-        _config["openai"]["api_key"] = os.environ["OPENAI_API_KEY"]
-    
+    loader = _ConfigLoader(
+        config_path=CONFIG_PATH,
+        default_config=DEFAULT_CONFIG,
+        environ=os.environ,
+    )
+    _config = loader.load()
     return _config
 
 def save_config(config: Dict[str, Any]) -> bool:
