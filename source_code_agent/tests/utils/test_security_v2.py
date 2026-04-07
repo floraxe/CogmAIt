@@ -239,3 +239,20 @@ async def test_get_user_by_token_invalid():
     """测试通过 Token 获取用户：无效 Token 场景"""
     result = await get_user_by_token(token="invalid.token.here")
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_get_user_by_token_expired():
+    """测试通过 Token 获取用户：过期 Token 场景"""
+    expired_token = create_access_token(
+        {"sub": "testuser"},
+        expires_delta=timedelta(minutes=-1),
+    )
+    result = await get_user_by_token(token=expired_token)
+    assert result is None
+
+
+def test_check_permission_user_no_permission():
+    """测试权限校验：普通用户对无权限资源应返回 False"""
+    normal_user = MagicMock(role="user", is_active=True)
+    assert check_permission(normal_user, "model:write") is False
