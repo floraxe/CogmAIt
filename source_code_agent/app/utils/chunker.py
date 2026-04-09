@@ -1,6 +1,7 @@
 import logging
 from typing import List, Optional, Dict, Any, Union
 from enum import Enum
+from app.domain.knowledge_chunk import KnowledgeChunk
 
 # 导入LangChain相关库
 from langchain_text_splitters import (
@@ -151,7 +152,7 @@ class TextChunker:
         is_separator_regex: bool = False,
         keep_separator: bool = False,
         metadata: Optional[Dict[str, Any]] = None
-    ) -> List[Dict[str, Any]]:
+    ) -> List[KnowledgeChunk]:
         """
         将文本分段
         
@@ -169,7 +170,7 @@ class TextChunker:
             metadata (Optional[Dict[str, Any]]): 元数据，会添加到每个分段中
             
         返回:
-            List[Dict[str, Any]]: 分段后的文本列表，每个元素包含文本和元数据
+            List[KnowledgeChunk]: 分段后的不可变知识块
         """
         if not text:
             return []
@@ -199,17 +200,21 @@ class TextChunker:
         chunks = chunker.create_documents([text], metadatas=[metadata or {}])
         
         # 将Document对象转换为字典
-        result = []
+        result: List[KnowledgeChunk] = []
         for i, chunk in enumerate(chunks):
             chunk_metadata = chunk.metadata.copy() if chunk.metadata else {}
             chunk_metadata.update({
                 "chunk_index": i,
                 "total_chunks": len(chunks)
             })
-            
-            result.append({
-                "text": chunk.page_content,
-                "metadata": chunk_metadata
-            })
+
+            result.append(
+                KnowledgeChunk.from_parts(
+                    text=chunk.page_content,
+                    chunk_index=i,
+                    total_chunks=len(chunks),
+                    metadata=chunk_metadata,
+                )
+            )
         
         return result 
