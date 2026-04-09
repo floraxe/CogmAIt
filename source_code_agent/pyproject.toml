@@ -1,4 +1,5 @@
 [project]
+
 name = "cogmait"
 version = "0.1.0"
 description = "CogmAIt AI智能体管理平台后端"
@@ -45,6 +46,7 @@ pinecone = "^8.1.0"
 openai = "^2.30.0"
 watchdog = "^6.0.0"
 modelscope = "^1.35.3"
+bcrypt = "4.0.1"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^9.0.2"
