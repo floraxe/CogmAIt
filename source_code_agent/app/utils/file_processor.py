@@ -11,6 +11,7 @@ from datetime import datetime
 import uuid
 import pandas as pd
 import uuid
+from app.domain.knowledge_chunk import KnowledgeChunk
 
 # 使用PyPDF2替代magic_pdf
 try:
@@ -675,7 +676,7 @@ def process_file(file_path: str, output_dir: str = None,filename_uuid:str=None,k
         return {"error": f"处理文件时发生错误: {str(e)}", "file_path": file_path}
 
 
-async def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> List[str]:
+async def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> List[KnowledgeChunk]:
     """
     将文本分成重叠的块
     
@@ -685,12 +686,12 @@ async def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> L
         overlap (int): 块之间的重叠大小
         
     返回:
-        List[str]: 文本块列表
+        List[KnowledgeChunk]: 不可变知识块列表
     """
     if not text:
         return []
     
-    chunks = []
+    chunks: List[str] = []
     start = 0
     text_length = len(text)
     
@@ -719,7 +720,15 @@ async def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> L
         # 更新起始位置，考虑重叠
         start = max(start + chunk_size - overlap, end - overlap)
     
-    return chunks 
+    return [
+        KnowledgeChunk.from_parts(
+            text=chunk_text_item,
+            chunk_index=index,
+            total_chunks=len(chunks),
+            metadata={"source": "file_processor.chunk_text"},
+        )
+        for index, chunk_text_item in enumerate(chunks)
+    ]
 
 async def extract_text_from_file(file_path: str, file_type: str) -> str:
     """

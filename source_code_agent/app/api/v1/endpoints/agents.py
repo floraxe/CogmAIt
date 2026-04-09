@@ -32,6 +32,7 @@ from app.utils.neo4j_utils import get_neo4j_service
 from app.utils.config import get_neo4j_config
 from app.utils import format_datetime  # 添加这行导入
 from app.models.agent import Agent, AgentChatHistory, AgentShareToken
+from app.domain.memory import MemoryManager
 import uuid
 from pydantic import ValidationError
 from datetime import datetime
@@ -360,7 +361,8 @@ async def chat_with_agent(
             used_tokens = 0
             sources = []
             web_search_results = []
-            final_messages = []
+            memory = MemoryManager()
+            final_messages = memory.messages()
             processed_file_contents = []  # 存储处理后的文件内容
             has_file_content = False  # 标记是否有文件内容
             
@@ -477,7 +479,8 @@ async def chat_with_agent(
                         "content": f"以下是用户上传的文件内容，这是非常重要的上下文信息，请务必仔细阅读并在回答问题时参考这些内容。如果用户询问关于文件内容的问题，请直接基于这些内容回答：\n\n{combined_content}"
                     }
                     # 将文件内容消息放在最前面，确保模型优先考虑
-                    final_messages.insert(0, file_context_message)
+                    memory.prepend_context(file_context_message["content"])
+                    final_messages = memory.messages()
                     
                     # 标记有文件内容
                     has_file_content = True
@@ -492,7 +495,8 @@ async def chat_with_agent(
             time.sleep(0.1)
             # 如果有系统提示词，添加到消息列表
             if agent.system_prompt:
-                final_messages.append({"role": "system", "content": agent.system_prompt})
+                memory.add_system_prompt(agent.system_prompt)
+                final_messages = memory.messages()
             
             # 处理网络搜索 - 如果启用了网络搜索
             if agent.enable_web_search:
@@ -524,7 +528,8 @@ async def chat_with_agent(
                             })
                         
                         # 添加网络搜索上下文
-                        final_messages.append({"role": "system", "content": web_search_context})
+                        memory.add_web_context(web_search_context)
+                        final_messages = memory.messages()
                         print("添加了网络搜索结果到上下文")
                         
                         # 发送网络搜索结果状态
@@ -1308,8 +1313,13 @@ async def chat_with_agent(
                     time.sleep(0.1)
             
             # 添加历史消息和当前用户消息
-            for msg in messages:
-                final_messages.append({"role": msg.role, "content": msg.content})
+            history_messages = [
+                {"role": msg.role, "content": msg.content}
+                for msg in messages
+                if msg.role in ["user", "assistant", "system"]
+            ]
+            memory.add_history(history_messages)
+            final_messages = memory.messages()
             
             # 打印完整的消息列表，用于调试
             print("发送给模型的完整消息列表:")
@@ -1424,10 +1434,10 @@ async def chat_with_agent(
                                     time.sleep(0.1)
                                     
                                     # 将MCP服务结果添加到消息中
-                                    final_messages.append({
-                                        "role": "system", 
-                                        "content": f"以下是调用MCP服务 '{service_name}' 的函数 '{function_name}' 的结果，请使用这些结果回答用户的问题:\n\n```json\n{json.dumps(mcp_result, ensure_ascii=False, indent=2)}\n```"
-                                    })
+                                    memory.add_tool_result(
+                                        f"以下是调用MCP服务 '{service_name}' 的函数 '{function_name}' 的结果，请使用这些结果回答用户的问题:\n\n```json\n{json.dumps(mcp_result, ensure_ascii=False, indent=2)}\n```"
+                                    )
+                                    final_messages = memory.messages()
                                 else:
                                     error_msg = f"请求的MCP服务ID {service_id} 不在当前智能体关联的服务列表中"
                                     print(error_msg)
@@ -1514,7 +1524,8 @@ async def chat_with_agent(
                         "role": "system", 
                         "content": f"以下是用户上传的文件内容，这是非常重要的上下文信息，请务必仔细阅读并在回答问题时参考这些内容。如果用户询问关于文件内容的问题，请直接基于这些内容回答：\n\n{combined_content}"
                     }
-                    final_messages.insert(0, file_context_message)
+                    memory.prepend_context(file_context_message["content"])
+                    final_messages = memory.messages()
                     has_file_content = True
                     print(f"强制添加文件内容到对话上下文: {combined_content[:100]}...")
             
@@ -1524,7 +1535,8 @@ async def chat_with_agent(
                     "role": "system",
                     "content": "用户正在询问文件内容。请直接回答文件的内容是什么，不要回避或者说找不到相关信息。文件内容已经在之前的系统消息中提供。"
                 }
-                final_messages.append(guidance_message)
+                memory.add_system_prompt(guidance_message["content"])
+                final_messages = memory.messages()
                 print("添加了额外的指导消息，引导模型回答文件内容相关问题")
             
             # 调用大模型生成回答
@@ -2115,13 +2127,18 @@ async def chat_with_agent_api(
                 
                 system_prompt += f"\n\n用户上传了以下文件，请基于这些文件内容回答问题：\n\n{file_content_text}"
             
-            # 构建消息列表
-            final_messages = [{"role": "system", "content": system_prompt}]
-            
+            # 构建消息列表（使用 ADT 保护上下文状态，避免裸列表在链路中被意外污染）
+            memory = MemoryManager()
+            memory.add_system_prompt(system_prompt)
+
             # 添加历史消息
-            for msg in messages:
-                if msg.role in ["user", "assistant", "system"]:
-                    final_messages.append({"role": msg.role, "content": msg.content})
+            history_messages = [
+                {"role": msg.role, "content": msg.content}
+                for msg in messages
+                if msg.role in ["user", "assistant", "system"]
+            ]
+            memory.add_history(history_messages)
+            final_messages = memory.messages()
             
             # 准备模型参数
             model_params = {
