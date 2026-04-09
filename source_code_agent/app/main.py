@@ -57,6 +57,12 @@ async def uniform_response_middleware(request: Request, call_next: Callable) -> 
     # 对于非API路径的请求，不做处理
     if not request.url.path.startswith(settings.API_V1_STR):
         return await call_next(request)
+
+    # OAuth2 标准 token 端点必须返回原生结构：
+    # {"access_token": "...", "token_type": "bearer"}
+    # 否则 Swagger UI 无法解析 token，会出现 "Bearer undefined"。
+    if request.url.path == f"{settings.API_V1_STR}/auth/token":
+        return await call_next(request)
     
     # 处理API路径的请求
     try:
