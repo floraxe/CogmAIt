@@ -1,10 +1,18 @@
 from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional, List, Union, AsyncGenerator
-import aiohttp
-import json
-import asyncio
+from typing import Dict, Any, Optional, List, Union, AsyncGenerator, TypedDict
 
 from app.schemas.model import ProviderInfo
+
+
+class ChatMessage(TypedDict):
+    role: str
+    content: str
+
+
+class ProviderConnectionResult(TypedDict, total=False):
+    status: str
+    message: str
+    response: Dict[str, Any]
 
 class ModelProvider(ABC):
     """
@@ -72,7 +80,7 @@ class ModelProvider(ABC):
     async def chat_completion(
         self, 
         api_key: str, 
-        messages: List[Dict[str, str]], 
+        messages: List[ChatMessage],
         model: str, 
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
@@ -151,6 +159,39 @@ class ModelProvider(ABC):
             Dict包含嵌入结果
         """
         pass
+
+    async def image_analysis(
+        self,
+        api_key: str,
+        image_path: str,
+        prompt: str,
+        model: str,
+        base_url: Optional[str] = None,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """
+        可选能力：图片分析。
+        仅当具体 Provider 声明支持视觉能力时实现该方法。
+        """
+        raise NotImplementedError(f"{self.provider_id} 不支持 image_analysis")
+
+    def validate_chat_messages(self, messages: List[Dict[str, Any]]) -> List[ChatMessage]:
+        """
+        统一校验聊天消息契约，避免调用端把脏数据传给子类实现。
+        """
+        normalized: List[ChatMessage] = []
+        allowed_roles = {"system", "user", "assistant", "tool"}
+        for idx, message in enumerate(messages):
+            if not isinstance(message, dict):
+                raise TypeError(f"messages[{idx}] 必须是 dict")
+            role = message.get("role")
+            content = message.get("content")
+            if role not in allowed_roles:
+                raise ValueError(f"messages[{idx}].role 非法: {role}")
+            if not isinstance(content, str):
+                raise TypeError(f"messages[{idx}].content 必须是字符串")
+            normalized.append({"role": role, "content": content})
+        return normalized
     
     def to_provider_info(self) -> Dict[str, Any]:
         """

@@ -32,9 +32,25 @@ from app.utils.model import get_model
 from app.providers.manager import provider_manager
 from app.utils.chunker import TextChunker, ChunkingMethod
 from app.core.config import settings
+from app.domain.knowledge_chunk import KnowledgeChunk
 
 # 配置日志
 logger = logging.getLogger(__name__)
+
+
+ChunkLike = Union[KnowledgeChunk, Dict[str, Any]]
+
+
+def _chunk_text(chunk: ChunkLike) -> str:
+    if isinstance(chunk, KnowledgeChunk):
+        return chunk.text
+    return chunk.get("text", "")
+
+
+def _chunk_metadata(chunk: ChunkLike) -> Dict[str, Any]:
+    if isinstance(chunk, KnowledgeChunk):
+        return chunk.metadata
+    return chunk.get("metadata", {})
 
 # 延迟导入settings以避免循环导入
 def get_api_keys():
@@ -163,7 +179,7 @@ class MilvusVectorStore:
     def insert_vectors(self, 
                         knowledge_id: str, 
                         file_id: str,
-                        chunks: List[Dict[str, Any]], 
+                        chunks: List[ChunkLike], 
                         embeddings: List[List[float]]) -> bool:
         """
         插入向量
@@ -171,7 +187,7 @@ class MilvusVectorStore:
         参数:
             knowledge_id (str): 知识库ID
             file_id (str): 文件ID
-            chunks (List[Dict[str, Any]]): 文本块列表
+            chunks (List[ChunkLike]): 文本块列表
             embeddings (List[List[float]]): 嵌入向量列表
             
         返回:
@@ -193,7 +209,7 @@ class MilvusVectorStore:
             data = []
             for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
                 # 提取基本元数据
-                metadata = chunk.get("metadata", {})
+                metadata = _chunk_metadata(chunk)
                 
                 # 使用整数ID，将字符串ID转换为整数哈希值
                 chunk_id = hash(f"{file_id}_{i}") % (2**63)
@@ -201,7 +217,7 @@ class MilvusVectorStore:
                 data.append({
                     "id": chunk_id,  # 使用整数ID
                     "vector": embedding,
-                    "text": chunk["text"],
+                    "text": _chunk_text(chunk),
                     "file_id": file_id,
                     "chunk_index": i,
                     "knowledge_id": knowledge_id,
@@ -377,7 +393,7 @@ class PineconeVectorStore:
             logger.error(f"创建Pinecone索引失败: {e}")
             return False
     
-    def insert_vectors(self, knowledge_id: str, file_id: str, chunks: List[Dict], embeddings: List[List[float]]):
+    def insert_vectors(self, knowledge_id: str, file_id: str, chunks: List[ChunkLike], embeddings: List[List[float]]):
         """插入向量到Pinecone"""
         if not self.pc:
             return False
@@ -393,7 +409,7 @@ class PineconeVectorStore:
                     "id": f"{file_id}_{i}",
                     "values": embedding,
                     "metadata": {
-                        "text": chunk["text"][:1000],  # Pinecone元数据限制
+                        "text": _chunk_text(chunk)[:1000],  # Pinecone元数据限制
                         "file_id": file_id,
                         "chunk_index": i,
                         "knowledge_id": knowledge_id
@@ -639,7 +655,7 @@ class EmbeddingManager:
         chunk_size: int = 1000,
         chunk_overlap: int = 200,
         separator: Optional[str] = None
-    ) -> Tuple[List[Dict[str, Any]], List[List[float]]]:
+    ) -> Tuple[List[KnowledgeChunk], List[List[float]]]:
         """
         处理文本并生成嵌入向量
         
@@ -654,7 +670,7 @@ class EmbeddingManager:
             separator (Optional[str]): 分隔符
             
         返回:
-            Tuple[List[Dict[str, Any]], List[List[float]]]: 分段和嵌入向量
+            Tuple[List[KnowledgeChunk], List[List[float]]]: 分段和嵌入向量
         """
         try:
             # 获取嵌入模型
@@ -678,7 +694,7 @@ class EmbeddingManager:
                 return [], []
                 
             # 提取文本内容用于生成嵌入向量
-            texts = [chunk["text"] for chunk in chunks]
+            texts = [chunk.text for chunk in chunks]
             
             # 生成嵌入向量
             embeddings = await EmbeddingManager.generate_embeddings(model, texts)
@@ -693,7 +709,7 @@ class EmbeddingManager:
     async def save_embeddings(
         output_dir: str,
         file_id: str,
-        chunks: List[Dict[str, Any]],
+        chunks: List[ChunkLike],
         embeddings: List[List[float]]
     ) -> Optional[str]:
         """
@@ -702,7 +718,7 @@ class EmbeddingManager:
         参数:
             output_dir (str): 输出目录
             file_id (str): 文件ID
-            chunks (List[Dict[str, Any]]): 分段列表
+            chunks (List[ChunkLike]): 分段列表
             embeddings (List[List[float]]): 嵌入向量列表
             
         返回:
@@ -724,8 +740,8 @@ class EmbeddingManager:
             for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
                 save_data.append({
                     "index": i,
-                    "text": chunk["text"],
-                    "metadata": chunk["metadata"],
+                    "text": _chunk_text(chunk),
+                    "metadata": _chunk_metadata(chunk),
                     "embedding": embedding
                 })
                 
@@ -734,7 +750,7 @@ class EmbeddingManager:
                 json.dump(save_data, f, ensure_ascii=False, indent=2)
             
             # 保存到向量数据库
-            knowledge_id = chunks[0]["metadata"].get("knowledge_id", "")
+            knowledge_id = _chunk_metadata(chunks[0]).get("knowledge_id", "")
             if knowledge_id:
                 vector_store = EmbeddingManager.get_vector_store()
                 vector_store.insert_vectors(knowledge_id, file_id, chunks, embeddings)
