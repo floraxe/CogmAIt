@@ -13,8 +13,8 @@ class SessionContext:
 
     Representation Invariant (RI):
         1) _messages 是一个列表，且列表长度不超过 _max_messages。
-        2) _messages 中每个元素必须是 dict，并且至少包含 role/content 字段。
-        3) role 只能是 _allowed_roles 中的值（默认: system, user, assistant）。
+        2) _messages 中每个元素必须是 dict,并且至少包含 role/content 字段。
+        3) role 只能是 _allowed_roles 中的值(默认: system, user, assistant)。
         4) content 必须是字符串（允许空字符串，由上游业务决定是否过滤空消息）。
         5) _max_messages 必须是正整数。
         6) _allowed_roles 必须是非空集合，且元素全部为字符串。

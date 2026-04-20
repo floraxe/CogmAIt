@@ -22,7 +22,7 @@ try:
     HAS_PYMILVUS = True
 except ImportError:
     HAS_PYMILVUS = False
-    logging.warning("pymilvus 模块导入失败，向量存储功能将不可用。请使用 pip install pymilvus 安装。")
+    logging.debug("pymilvus 未安装，Milvus 相关功能不可用。")
 
 # 将模块变量导出
 __all__ = ['MilvusVectorStore', 'PineconeVectorStore', 'EmbeddingManager', 'HAS_PYMILVUS', 'HAS_PINECONE']

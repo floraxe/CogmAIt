@@ -10,7 +10,7 @@ try:
     MODELSCOPE_AVAILABLE = True
 except ImportError:
     MODELSCOPE_AVAILABLE = False
-    logging.warning("modelscope未安装，本地模型功能不可用")
+    logging.debug("modelscope 未安装，本地模型功能不可用。")
 
 logger = logging.getLogger(__name__)
 

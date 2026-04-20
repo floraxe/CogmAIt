@@ -65,6 +65,37 @@ python run.py
 
 服务将在 http://localhost:8000 启动，API文档可在 http://localhost:8000/docs 访问。
 
+## Windows 一键启动（推荐）
+
+项目已提供 `docker compose` 和 PowerShell 脚本，可替代手动逐条输入命令。
+
+1. 首次执行（安装依赖并启动 MySQL/MinIO）：
+
+```powershell
+cd E:\source\source_code_agent
+.\scripts\bootstrap.ps1
+```
+
+2. 日常启动（每次开发时执行）：
+
+```powershell
+cd E:\source\source_code_agent
+.\scripts\start-dev.ps1
+```
+
+3. 停止容器：
+
+```powershell
+cd E:\source\source_code_agent
+.\scripts\stop-dev.ps1
+```
+
+说明：
+- 依赖已写入 `pyproject.toml`，无需每次 `poetry add ...`。
+- `docker-compose.yml` 会自动创建 `cogmait` 数据库（由 MySQL 容器环境变量 `MYSQL_DATABASE` 完成），不再需要手动执行 `CREATE DATABASE`。
+- 脚本会优先复用已存在的 `minio-server` 容器；不存在时再用 compose 创建，避免容器重名冲突。
+- Poetry 安装使用 `poetry install --no-root`，避免 `No file/folder found for package` 报错。
+
 ## 目录结构
 
 ```
