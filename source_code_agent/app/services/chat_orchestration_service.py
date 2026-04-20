@@ -1,7 +1,11 @@
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, AsyncGenerator
 import os
 import tempfile
+import json
+import time
+import traceback
+import re
 
 from sqlalchemy.orm import Session
 
@@ -12,6 +16,10 @@ from app.utils.model import execute_model_inference
 from app.utils.web_search import search_web, get_web_search_client
 from app.utils.knowledge import get_knowledge, get_knowledge_file
 from app.utils.embedding import EmbeddingManager
+from app.utils.llm_knowledge_extractor import LLMKnowledgeExtractor
+from app.utils.neo4j_utils import get_neo4j_service
+from app.utils.config import get_neo4j_config
+from app.utils import agent as agent_utils
 
 
 @dataclass
@@ -570,3 +578,278 @@ class ChatResponseService:
         if has_file_content:
             extra_data["has_file_content"] = True
         return extra_data
+
+
+class GraphRetrievalService:
+    async def stream_graph_events(
+        self,
+        db: Session,
+        agent: Any,
+        user_message: str,
+        model_id: str,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        if not getattr(agent, "graphs", None):
+            return
+
+        graph_list = {"nodes": [], "links": []}
+        yield {
+            "event": "graph_search",
+            "data": '{"object": "chat.completion.graph_search", "status": "正在查询知识图谱"}',
+            "sleep": 0.1,
+        }
+        try:
+            neo4j_config = get_neo4j_config()
+            yield {
+                "event": "graph_connecting",
+                "data": '{"object": "chat.completion.graph_connecting", "status": "正在连接知识图谱数据库"}',
+                "sleep": 0.1,
+            }
+            neo4j_service = get_neo4j_service(
+                uri=neo4j_config.get("uri"),
+                username=neo4j_config.get("username"),
+                password=neo4j_config.get("password"),
+                database=neo4j_config.get("database"),
+                force_new=True,
+            )
+            if not neo4j_service or not neo4j_service.driver or not neo4j_service.is_connected():
+                yield {
+                    "event": "graph_connecting_error",
+                    "data": '{"object": "chat.completion.graph_connection_error", "status": "Neo4j服务初始化失败"}',
+                    "sleep": 0.1,
+                }
+                return
+
+            yield {
+                "event": "graph_connected",
+                "data": '{"object": "chat.completion.graph_connected", "status": "知识图谱数据库连接成功"}',
+                "sleep": 0.1,
+            }
+
+            extractor = LLMKnowledgeExtractor(db=db)
+            for gb in agent.graphs:
+                graph = agent_utils.get_graph(db, gb.id)
+                if not graph or not graph.neo4j_subgraph:
+                    continue
+
+                schema = None
+                try:
+                    from app.utils.graph import get_graph_schema
+
+                    schema = get_graph_schema(db, graph.id)
+                    yield {
+                        "event": "graph_schema",
+                        "data": '{"object": "chat.completion.graph_schema", "status": "已获取知识图谱结构定义"}',
+                        "sleep": 0.1,
+                    }
+                except Exception as exc:
+                    yield {
+                        "event": "graph_schema_error",
+                        "data": json.dumps(
+                            {
+                                "object": "chat.completion.graph_schema_error",
+                                "status": "获取图谱结构定义失败",
+                                "error": str(exc),
+                            },
+                            ensure_ascii=False,
+                        ),
+                        "sleep": 0.1,
+                    }
+
+                yield {
+                    "event": "graph_analysis",
+                    "data": '{"object": "chat.completion.graph_analysis", "status": "正在分析问题与知识图谱的关联"}',
+                    "sleep": 0.1,
+                }
+
+                extraction_prompt = f"""
+                请分析用户问题并给出Neo4j Cypher查询，仅返回JSON:
+                {{
+                  "cypher": "MATCH (n) RETURN n LIMIT 15"
+                }}
+                用户问题: "{user_message}"
+                图谱Schema: {json.dumps(schema, ensure_ascii=False) if schema else "未定义schema"}
+                """
+                extraction_result = await execute_model_inference(
+                    db,
+                    model_id,
+                    {
+                        "messages": [
+                            {"role": "system", "content": "你是一个生成Neo4j Cypher查询的助手。"},
+                            {"role": "user", "content": extraction_prompt},
+                        ],
+                        "model_type": "chat",
+                    },
+                )
+
+                yield {
+                    "event": "graph_query_generated",
+                    "data": '{"object": "chat.completion.graph_query_generated", "status": "已生成知识图谱查询语句"}',
+                    "sleep": 0.1,
+                }
+
+                cypher_query = self._extract_cypher(extraction_result, user_message, graph.neo4j_subgraph)
+                if not cypher_query:
+                    yield {
+                        "event": "graph_search_error",
+                        "data": '{"object": "chat.completion.graph_search_error", "status": "无法生成有效的知识图谱查询"}',
+                        "sleep": 0.1,
+                    }
+                    continue
+
+                yield {
+                    "event": "graph_search",
+                    "data": '{"object": "chat.completion.graph_search", "status": "正在查询知识图谱..."}',
+                    "sleep": 0.5,
+                }
+                try:
+                    with neo4j_service.driver.session(database=neo4j_service.database) as session:
+                        records = list(session.run(cypher_query))
+                    if not records:
+                        yield {
+                            "event": "graph_search_complete",
+                            "data": '{"object": "chat.completion.graph_search_complete", "status": "知识图谱中未找到相关信息", "graphList": {"nodes": [], "links": []}}',
+                            "sleep": 0.1,
+                        }
+                        continue
+
+                    graph_list = self._build_graph_list(records)
+                    yield {
+                        "event": "graph_search_complete",
+                        "data": json.dumps(
+                            {
+                                "object": "chat.completion.graph_search_complete",
+                                "status": "知识图谱搜索完成",
+                                "graphList": graph_list,
+                            },
+                            ensure_ascii=False,
+                        ),
+                        "sleep": 0.5,
+                    }
+                except Exception as exc:
+                    yield {
+                        "event": "graph_search_error",
+                        "data": json.dumps(
+                            {
+                                "object": "chat.completion.graph_search_error",
+                                "status": "执行知识图谱查询失败",
+                                "error": str(exc),
+                            },
+                            ensure_ascii=False,
+                        ),
+                        "sleep": 0.1,
+                    }
+            yield {
+                "event": "graph_search_complete",
+                "data": json.dumps(
+                    {
+                        "object": "chat.completion.graph_search_complete",
+                        "status": "知识图谱查询完成",
+                        "graphList": graph_list,
+                    },
+                    ensure_ascii=False,
+                ),
+                "sleep": 0.1,
+            }
+        except Exception as exc:
+            yield {
+                "event": "graph_search_error",
+                "data": json.dumps(
+                    {
+                        "object": "chat.completion.graph_search_error",
+                        "status": "知识图谱查询失败",
+                        "error": str(exc),
+                    },
+                    ensure_ascii=False,
+                ),
+                "sleep": 0.1,
+            }
+
+    @staticmethod
+    def _extract_cypher(extraction_result: Any, user_message: str, subgraph_name: str) -> Optional[str]:
+        subgraph_id = (subgraph_name or "").lower().replace(" ", "_").replace("-", "_")
+        message_content = ""
+        if isinstance(extraction_result, dict):
+            choices = extraction_result.get("choices") or []
+            if choices:
+                message_content = choices[0].get("message", {}).get("content", "")
+        elif isinstance(extraction_result, str):
+            message_content = extraction_result
+
+        if message_content:
+            code_match = re.search(r'```(?:json)?\s*({[\s\S]*?})\s*```', message_content)
+            try:
+                payload = json.loads(code_match.group(1) if code_match else message_content)
+                if isinstance(payload, dict) and payload.get("cypher"):
+                    cypher = payload["cypher"]
+                    return GraphRetrievalService._normalize_cypher(cypher, subgraph_id, user_message)
+            except Exception:
+                pass
+
+            for pattern in [
+                r'```cypher\s*(MATCH[\s\S]+?)\s*```',
+                r'```\s*(MATCH[\s\S]+?)\s*```',
+                r'(MATCH\s*\([^)]+\)[\s\S]+?RETURN[^;]+)',
+            ]:
+                matches = re.findall(pattern, message_content, re.IGNORECASE)
+                if matches:
+                    return GraphRetrievalService._normalize_cypher(matches[0].strip(), subgraph_id, user_message)
+
+        fallback_entity = user_message.strip().replace("'", "")
+        fallback = f"MATCH (n) WHERE n.graph_id = '{subgraph_id}' AND n.name CONTAINS '{fallback_entity}' RETURN n LIMIT 20"
+        return fallback
+
+    @staticmethod
+    def _normalize_cypher(cypher_query: str, subgraph_id: str, user_message: str) -> str:
+        cypher_query = re.sub(r"MATCH\s*\(\w+:\w+\)", "MATCH (n)", cypher_query)
+        cypher_query = cypher_query.replace("...", "").strip().replace('"', "'").replace("''", "'")
+        if "WHERE" in cypher_query.upper():
+            where_pos = cypher_query.upper().find("WHERE")
+            return_pos = cypher_query.upper().find("RETURN", where_pos)
+            where_part = cypher_query[where_pos:return_pos] if return_pos != -1 else cypher_query[where_pos:]
+            if "graph_id" not in where_part.lower():
+                if return_pos != -1:
+                    new_where = f"WHERE n.graph_id = '{subgraph_id}' AND " + where_part[5:].strip()
+                    cypher_query = cypher_query[:where_pos] + new_where + cypher_query[return_pos:]
+                else:
+                    cypher_query = cypher_query.replace("WHERE", f"WHERE n.graph_id = '{subgraph_id}' AND ")
+        else:
+            return_pos = cypher_query.upper().find("RETURN")
+            if return_pos > 0:
+                cypher_query = cypher_query[:return_pos] + f" WHERE n.graph_id = '{subgraph_id}' " + cypher_query[return_pos:]
+            else:
+                entity = user_message.strip().replace("'", "")
+                cypher_query = f"MATCH (n) WHERE n.graph_id = '{subgraph_id}' AND n.name CONTAINS '{entity}' RETURN n LIMIT 20"
+        return cypher_query
+
+    @staticmethod
+    def _build_graph_list(records: List[Any]) -> Dict[str, List[Dict[str, Any]]]:
+        nodes: Dict[str, Dict[str, Any]] = {}
+        links: Dict[str, Dict[str, Any]] = {}
+        for record in records:
+            for _, value in record.items():
+                if value is None:
+                    continue
+                if hasattr(value, "id") and hasattr(value, "labels"):
+                    node_id = str(value.id)
+                    props = dict(value.properties) if hasattr(value, "properties") else {}
+                    node_name = props.get("name") or props.get("title") or f"节点{node_id}"
+                    node_type = list(value.labels)[0] if getattr(value, "labels", None) else "Entity"
+                    nodes[node_id] = {
+                        "id": node_id,
+                        "name": str(node_name),
+                        "symbolSize": 50,
+                        "category": str(node_type),
+                        "properties": props,
+                    }
+                elif hasattr(value, "type") and hasattr(value, "start_node") and hasattr(value, "end_node"):
+                    start_id = str(value.start_node.id)
+                    end_id = str(value.end_node.id)
+                    rel_type = str(value.type)
+                    link_id = f"{start_id}_{rel_type}_{end_id}"
+                    links[link_id] = {
+                        "source": start_id,
+                        "target": end_id,
+                        "value": rel_type,
+                        "properties": dict(value.properties) if hasattr(value, "properties") else {},
+                    }
+        return {"nodes": list(nodes.values()), "links": list(links.values())}
