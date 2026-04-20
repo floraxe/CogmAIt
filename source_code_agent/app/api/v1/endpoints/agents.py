@@ -9,10 +9,7 @@ from sse_starlette.sse import EventSourceResponse
 
 # 配置日志
 logger = logging.getLogger(__name__)
-from app.utils.embedding import EmbeddingManager
 from app.utils.model import execute_model_inference
-from app.utils.knowledge import get_knowledge
-from app.utils.web_search import search_web, get_web_search_client
 from app.db.session import get_db
 from app.utils.deps import get_current_active_user
 from app.utils import agent as agent_utils
@@ -32,7 +29,11 @@ from app.utils import format_datetime  # 添加这行导入
 from app.models.agent import AgentChatHistory, AgentShareToken
 from app.domain.memory import MemoryManager
 from pydantic import ValidationError
-from app.services.chat_orchestration_service import DocumentContextService, ModelInferenceService
+from app.services.chat_orchestration_service import (
+    DocumentContextService,
+    ModelInferenceService,
+    RetrievalAugmentationService,
+)
 
 router = APIRouter()
 
@@ -362,6 +363,7 @@ async def chat_with_agent(
             final_messages = memory.messages()
             document_service = DocumentContextService()
             inference_service = ModelInferenceService()
+            retrieval_service = RetrievalAugmentationService()
             processed_file_contents = []  # 存储处理后的文件内容
             has_file_content = False  # 标记是否有文件内容
             
@@ -397,152 +399,18 @@ async def chat_with_agent(
                 memory.add_system_prompt(agent.system_prompt)
                 final_messages = memory.messages()
             
-            # 处理网络搜索 - 如果启用了网络搜索
-            if agent.enable_web_search:
-                # 发送网络搜索状态
-                yield {"event": "web_search", "data": json.dumps({"object": "chat.completion.web_search", "status": "正在联网搜索最新信息"}, ensure_ascii=False)}
-                time.sleep(0.5)
-                try:
-                    print(f"执行网络搜索: {user_message}")
-                    
-                    # 调用网络搜索API
-                    search_results = await search_web(user_message)
-                    
-                    if search_results.get("results"):
-                        # 将搜索结果保存，稍后添加到响应中
-                        web_search_results = search_results.get("results", [])
-                        
-                        # 格式化搜索结果
-                        web_search_client = get_web_search_client()
-                        web_search_context = web_search_client.format_search_results(search_results)
-                        
-                        # 搜索结果信息来源
-                        for i, result in enumerate(search_results.get("results", []), 1):
-                            sources.append({
-                                "content": result.get("content", ""),
-                                "score": 1.0,  # 网络搜索结果默认高分
-                                "source_file": result.get("title", "网络搜索结果"),
-                                "url": result.get("url", ""),
-                                "type": "web_search"  # 标记为网络搜索类型的来源
-                            })
-                        
-                        # 添加网络搜索上下文
-                        memory.add_web_context(web_search_context)
-                        final_messages = memory.messages()
-                        print("添加了网络搜索结果到上下文")
-                        
-                        # 发送网络搜索结果状态
-                        yield {"event": "web_search_complete", "data": json.dumps({"object": "chat.completion.web_search_complete", "status": "已找到相关信息", "results_count": len(web_search_results), "webList": web_search_results },ensure_ascii=False)}
-                        time.sleep(0.5)
-                    else:
-                        print("网络搜索未返回结果")
-                        yield {"event": "web_search_complete", "data": '{"object": "chat.completion.web_search_complete", "status": "未找到相关网络信息", "results_count": 0, "webList": []}'}
-                        time.sleep(0.1)
-                except Exception as e:
-                    print(f"网络搜索失败: {str(e)}")
-                    traceback.print_exc()
-                    yield {"event": "web_search_complete", "data": f'{{"object": "chat.completion.web_search_complete", "status": "网络搜索过程中发生错误", "error": "{str(e)}", "webList": []}}'}
-                    time.sleep(0.1)
-            
-            # 获取相关知识条目（如果需要）
-            if agent.knowledge_bases:
-                # 发送知识库检索状态
-                yield {"event": "knowledge_search", "data": '{"object": "chat.completion.knowledge_search", "status": "正在检索知识库相关内容"}'}
-                time.sleep(0.1)
-                
-                # 提取配置中的相似度阈值和召回条目数
-                similarity_threshold = config.get("similarity_threshold", 0.7)
-                top_k = config.get("top_k", 5)
-                
-                # 从知识库中检索相关信息
-                retrieval_results = []
-                kb_processed = 0
-                total_kb = len(agent.knowledge_bases)
-                
-                for kb in agent.knowledge_bases:
-                    kb_processed += 1
-                    # 发送知识库检索进度
-                    yield {"event": "knowledge_progress", "data": '{"object": "chat.completion.knowledge_progress", "status": "正在检索知识库", "progress": {kb_processed}/{total_kb}}'}
-                    time.sleep(0.1)
-                
-                    knowledge = get_knowledge(db, kb.id)
-                    if not knowledge or not knowledge.embedding_model:
-                        continue
-                
-                    # 生成查询向量
-                    yield {"event": "embedding", "data": '{"object": "chat.completion.embedding", "status": "正在计算语义向量"}'}
-                    time.sleep(0.1)
-                    
-                    query_embedding_result = await execute_model_inference(
-                        db,
-                        knowledge.embedding_model,
-                        {
-                            "input": [user_message],
-                            "model_type": "embedding"
-                        }
-                    )
-                
-                    if "error" in query_embedding_result:
-                        print(f"生成查询向量失败: {query_embedding_result['error']}")
-                        yield {"event": "embedding_error", "data": '{"object": "chat.completion.embedding_error", "status": "向量计算失败", "error": {query_embedding_result["error"]}}'}
-                        time.sleep(0.1)
-                        continue
-                
-                    # 获取查询向量
-                    query_embedding = query_embedding_result.get("embeddings", [])[0]
-                
-                    # 在向量库中搜索
-                    vector_store = EmbeddingManager.get_vector_store()
-                    if not vector_store or vector_store.client is None:
-                        print("向量存储服务不可用")
-                        yield {"event": "vector_store_error", "data": '{"object": "chat.completion.vector_store_error", "status": "向量存储服务不可用"}'}
-                        time.sleep(0.1)
-                        continue
-                
-                    # 执行检索
-                    yield {"event": "vector_search", "data": '{"object": "chat.completion.vector_search", "status": "正在检索相似文档"}'}
-                    time.sleep(0.1)
-                    
-                    results = vector_store.search_similar(
-                        knowledge_id=kb.id,
-                        query_vector=query_embedding,
-                        limit=top_k,
-                        filter_expr=None
-                    )
-                    # 处理结果，补充文件信息
-                    result_count = 0
-                    for hit in results:
-                        # 获取对应的文件信息
-                        from app.utils.knowledge import get_knowledge_file
-                        file_id = hit.get("file_id", "")
-                        file_info = get_knowledge_file(db, file_id)
-                        file_name = file_info.original_filename if file_info else "未知文件"
-                        
-                        # 计算得分，确保分数在0到1之间
-                        score = hit.get("score", 0)
-                        if score < 0:
-                            score = 0
-                        elif score > 1:
-                            score = 1
-                        
-                        # 只添加符合相似度阈值的结果
-                        if score >= similarity_threshold:
-                            result_count += 1
-                            retrieval_results.append({
-                                "content": hit.get("text", "").replace(" ","").replace("\n","").replace("\\n","")[:512]+"...",
-                                "score": score,
-                                "source_file": file_name.replace(" ","").replace("\n","").replace("\\n",""),
-                                "file_id": file_id,
-                                "knowledge_id": kb.id,
-                                "knowledge_name": knowledge.name.replace(" ","").replace("\n","").replace("\\n",""),
-                                "chunk_id": hit.get("chunk_index", 0),
-                                "type": "document"  # 标记为文档类型的来源
-                            })
-                    
-                    # 发送检索结果状态
-                    
-                yield {"event": "vector_search_complete", "data": '{"object": "chat.completion.vector_search_complete", "status": "知识库检索完成，找到{result_count}条相关内容", "results_count": {result_count}, "ragList": []}'}
-                time.sleep(0.5)
+            retrieval_result = await retrieval_service.run(memory, db, agent, user_message, config)
+            for event_item in retrieval_result.events:
+                yield {
+                    "event": event_item["event"],
+                    "data": json.dumps(event_item["data"], ensure_ascii=False),
+                }
+                time.sleep(event_item.get("sleep", 0.1))
+            if retrieval_result.sources:
+                sources.extend(retrieval_result.sources)
+            if retrieval_result.web_search_results:
+                web_search_results = retrieval_result.web_search_results
+            final_messages = memory.messages()
             
             # 构建图谱可视化数据
             graphList = {
