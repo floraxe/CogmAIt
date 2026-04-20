@@ -1,11 +1,9 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, status, Body, Header, Request
-from fastapi.responses import StreamingResponse, Response, JSONResponse
+from fastapi import APIRouter, Depends, HTTPException, Query, status, Body, Header
 from sqlalchemy.orm import Session
-from typing import List, Dict, Any, Optional, AsyncIterable, AsyncGenerator
+from typing import Dict, Any, Optional
 import time
 import json
 import traceback  # 确保导入 traceback 模块
-import asyncio
 import logging
 from sse_starlette.sse import EventSourceResponse
 
@@ -16,7 +14,7 @@ from app.utils.model import execute_model_inference
 from app.utils.knowledge import get_knowledge
 from app.utils.web_search import search_web, get_web_search_client
 from app.db.session import get_db
-from app.utils.deps import get_current_active_user, get_optional_current_user
+from app.utils.deps import get_current_active_user
 from app.utils import agent as agent_utils
 from app.schemas.agent import (
     AgentCreate, 
@@ -31,11 +29,10 @@ from app.utils.llm_knowledge_extractor import LLMKnowledgeExtractor
 from app.utils.neo4j_utils import get_neo4j_service
 from app.utils.config import get_neo4j_config
 from app.utils import format_datetime  # 添加这行导入
-from app.models.agent import Agent, AgentChatHistory, AgentShareToken
+from app.models.agent import AgentChatHistory, AgentShareToken
 from app.domain.memory import MemoryManager
-import uuid
 from pydantic import ValidationError
-from datetime import datetime
+from app.services.chat_orchestration_service import DocumentContextService, ModelInferenceService
 
 router = APIRouter()
 
@@ -363,6 +360,8 @@ async def chat_with_agent(
             web_search_results = []
             memory = MemoryManager()
             final_messages = memory.messages()
+            document_service = DocumentContextService()
+            inference_service = ModelInferenceService()
             processed_file_contents = []  # 存储处理后的文件内容
             has_file_content = False  # 标记是否有文件内容
             
@@ -371,122 +370,22 @@ async def chat_with_agent(
                 logger.info(f"开始处理文件，文件ID列表: {file_ids}")
                 yield {"event": "status", "data": json.dumps({"object": "chat.completion.status", "status": "正在处理上传文件"}, ensure_ascii=False)}
                 time.sleep(0.1)
-                
-                # 导入文件模型和处理函数
-                from app.models.file import File as FileModel
-                from app.utils.file_processor import extract_text_from_file_path
-                
-                # 处理每个文件
-                for file_id in file_ids:
-                    try:
-                        # 从数据库获取文件记录
-                        file = db.query(FileModel).filter(FileModel.id == file_id).first()
-                        logger.debug(f"处理文件ID: {file_id}, 文件存在: {file is not None}")
-                        if not file:
-                            yield {"event": "file_processing", "data": json.dumps({"status": f"文件不存在: {file_id}"}, ensure_ascii=False)}
-                            time.sleep(0.1)
-                            continue
-                        
-                        # 检查文件状态
-                        logger.debug(f"文件状态: {file.status}, 文件名: {file.original_filename}, 文件类型: {file.file_type}")
-                        if file.status != "processed":
-                            if file.status == "processing":
-                                yield {"event": "file_processing", "data": json.dumps({"status": f"文件 {file.original_filename} 正在处理中，请稍后再试"}, ensure_ascii=False)}
-                            else:
-                                yield {"event": "file_processing", "data": json.dumps({"status": f"文件 {file.original_filename} 未处理完成，状态: {file.status}"}, ensure_ascii=False)}
-                            time.sleep(0.1)
-                            continue
-                        
-                        # 获取文件内容
-                        file_content = ""
-                        if file.text_content:
-                            # 如果数据库中已有提取的文本内容，直接使用
-                            file_content = file.text_content
-                            logger.debug(f"从数据库获取文件内容，长度: {len(file_content)}")
-                        else:
-                            # 尝试从MinIO获取文件内容
-                            from app.core.minio_client import get_file_stream, RAW_BUCKET
-                            
-                            try:
-                                # 从路径中提取bucket和object_name
-                                if file.path and '/' in file.path:
-                                    bucket, object_name = file.path.split('/', 1)
-                                    
-                                    # 获取文件流
-                                    response = get_file_stream(bucket, object_name)
-                                    if response:
-                                        # 创建临时文件
-                                        import tempfile
-                                        import os
-                                        
-                                        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file.file_type}") as temp_file:
-                                            temp_file.write(response.read())
-                                            temp_file_path = temp_file.name
-                                        
-                                        try:
-                                            # 提取文本
-                                            file_content = await extract_text_from_file_path(temp_file_path)
-                                            if not file_content or file_content.startswith("提取文件文本内容时出错"):
-                                                # 如果提取失败，尝试简单读取文件内容
-                                                try:
-                                                    with open(temp_file_path, 'r', encoding='utf-8') as f:
-                                                        file_content = f.read()
-                                                except UnicodeDecodeError:
-                                                    try:
-                                                        with open(temp_file_path, 'r', encoding='latin-1') as f:
-                                                            file_content = f.read()
-                                                    except Exception as read_err:
-                                                        print(f"读取文件内容失败: {read_err}")
-                                            
-                                            # 删除临时文件
-                                            if os.path.exists(temp_file_path):
-                                                os.unlink(temp_file_path)
-                                        except Exception as e:
-                                            yield {"event": "file_processing", "data": json.dumps({"status": f"处理文件 {file.original_filename} 时出错: {str(e)}"}, ensure_ascii=False)}
-                                            time.sleep(0.1)
-                                            # 确保临时文件被删除
-                                            if 'temp_file_path' in locals() and os.path.exists(temp_file_path):
-                                                os.unlink(temp_file_path)
-                            except Exception as e:
-                                yield {"event": "file_processing", "data": json.dumps({"status": f"获取文件 {file.original_filename} 内容时出错: {str(e)}"}, ensure_ascii=False)}
-                                time.sleep(0.1)
-                        
-                        if file_content:
-                            # 为长文件添加摘要和省略指示
-                            max_content_length = 3000  # 最大内容长度限制
-                            if len(file_content) > max_content_length:
-                                truncated_content = file_content[:max_content_length] + f"\n\n[内容过长，已截断。原文共 {len(file_content)} 字符]"
-                                file_content = truncated_content
-                            
-                            # 格式化文件内容，添加文件信息
-                            formatted_content = f"--- 文件: {file.original_filename} ({file.file_type}) ---\n\n{file_content}\n\n"
-                            processed_file_contents.append(formatted_content)
-                            
-                            yield {"event": "file_processing", "data": json.dumps({"status": f"已处理文件: {file.original_filename}"}, ensure_ascii=False)}
-                            time.sleep(0.1)
-                    except Exception as e:
-                        yield {"event": "file_processing", "data": json.dumps({"status": f"处理文件ID {file_id} 时出错: {str(e)}"}, ensure_ascii=False)}
-                        time.sleep(0.1)
-                
-                # 如果成功处理了文件，将文件内容添加到对话中
-                if processed_file_contents:
-                    combined_content = "\n".join(processed_file_contents)
-                    logger.info(f"成功处理文件内容，总长度: {len(combined_content)}")
-                    
-                    # 添加系统消息，包含文件内容，放在消息列表的最前面
-                    file_context_message = {
-                        "role": "system", 
-                        "content": f"以下是用户上传的文件内容，这是非常重要的上下文信息，请务必仔细阅读并在回答问题时参考这些内容。如果用户询问关于文件内容的问题，请直接基于这些内容回答：\n\n{combined_content}"
-                    }
-                    # 将文件内容消息放在最前面，确保模型优先考虑
-                    memory.prepend_context(file_context_message["content"])
+                file_context_result = await document_service.process_files(db, file_ids)
+                for status_msg in file_context_result.processed_messages:
+                    yield {"event": "file_processing", "data": json.dumps({"status": status_msg}, ensure_ascii=False)}
+                    time.sleep(0.1)
+                for error_msg in file_context_result.error_messages:
+                    yield {"event": "file_processing", "data": json.dumps({"status": error_msg}, ensure_ascii=False)}
+                    time.sleep(0.1)
+
+                processed_file_contents = file_context_result.formatted_contexts
+                file_system_context = document_service.build_system_context(processed_file_contents)
+                if file_system_context:
+                    logger.info(f"成功处理文件内容，总长度: {len(file_system_context)}")
+                    memory.prepend_context(file_system_context)
                     final_messages = memory.messages()
-                    
-                    # 标记有文件内容
                     has_file_content = True
-                    
-                    # 添加日志，便于调试
-                    print(f"添加文件内容到对话上下文: {combined_content[:100]}...")
+                    print(f"添加文件内容到对话上下文: {file_system_context[:100]}...")
                 else:
                     print("没有成功处理任何文件内容")
             
@@ -1507,27 +1406,13 @@ async def chat_with_agent(
             # 如果没有检测到文件内容但有文件ID，强制添加一个提示
             if not has_file_content and file_ids:
                 print(f"未检测到文件内容但有文件ID，强制添加文件内容提示")
-                # 从数据库中获取文件内容
-                from app.models.file import File as FileModel
-                
-                file_contents = []
-                for file_id in file_ids:
-                    file = db.query(FileModel).filter(FileModel.id == file_id).first()
-                    if file and file.text_content:
-                        formatted_content = f"--- 文件: {file.original_filename} ({file.file_type}) ---\n\n{file.text_content}\n\n"
-                        file_contents.append(formatted_content)
-                        print(f"添加文件内容: {file.original_filename}, 长度: {len(file.text_content)}")
-                
-                if file_contents:
-                    combined_content = "\n".join(file_contents)
-                    file_context_message = {
-                        "role": "system", 
-                        "content": f"以下是用户上传的文件内容，这是非常重要的上下文信息，请务必仔细阅读并在回答问题时参考这些内容。如果用户询问关于文件内容的问题，请直接基于这些内容回答：\n\n{combined_content}"
-                    }
-                    memory.prepend_context(file_context_message["content"])
+                fallback_contexts = await document_service.load_plain_text_contexts(db, file_ids)
+                fallback_system_context = document_service.build_system_context(fallback_contexts)
+                if fallback_system_context:
+                    memory.prepend_context(fallback_system_context)
                     final_messages = memory.messages()
                     has_file_content = True
-                    print(f"强制添加文件内容到对话上下文: {combined_content[:100]}...")
+                    print(f"强制添加文件内容到对话上下文: {fallback_system_context[:100]}...")
             
             if has_file_content and ("文档说的什么" in user_message or "文档说了什么" in user_message or "文件内容是什么" in user_message or "文件说了什么" in user_message or "文件说的什么" in user_message):
                 # 添加额外的系统消息，指导模型如何回答
@@ -1540,43 +1425,17 @@ async def chat_with_agent(
                 print("添加了额外的指导消息，引导模型回答文件内容相关问题")
             
             # 调用大模型生成回答
-            model_response = await execute_model_inference(
-                db,
-                model_id,
-                {
-                    "messages": final_messages,
-                    "stream": True,
-                    **config
-                }
-            )
+            model_payload = inference_service.build_stream_payload(final_messages, config)
+            model_response = await inference_service.run_stream(db, model_id, model_payload)
             response_content = ""
             # 处理流式响应
             async for chunk in model_response:
-                # 检查chunk的类型，如果是工具调用，使用特定的事件类型
-                if isinstance(chunk, dict) and chunk.get("choices"):
-                    choice = chunk.get("choices", [{}])[0]
-                    delta = choice.get("delta", {})
-                    
-                    if delta.get("tool_calls"):
-                        # 工具调用事件
-                        yield {"event": "tool_calls", "data":chunk}
-                        time.sleep(0.1)
-                    elif choice.get("finish_reason") == "tool_calls":
-                        # 工具调用结果事件
-                        yield {"event": "tool_call_result", "data":chunk}
-                        time.sleep(0.1)
-                    else:
-                        # 普通消息块
-                        yield {"event": "message_chunk", "data":chunk}
-                else:
-                    # 默认消息块
-                    try:
-                        response_content += json.loads(chunk)["choices"][0]["delta"]["content"]
-                    except Exception as e:
-                        print("response_content += json.loads(chunk)::",response_content,"\n\n:::",chunk)
-                        pass
-                    # print(response_content)
-                    yield {"event": "message_chunk", "data":chunk}
+                event_name, event_data, delta_content = inference_service.normalize_stream_chunk(chunk)
+                if delta_content:
+                    response_content += delta_content
+                yield {"event": event_name, "data": event_data}
+                if event_name in ["tool_calls", "tool_call_result"]:
+                    time.sleep(0.1)
             # 流处理完成
             end_time = time.time()
             response_time = int((end_time - start_time) * 1000)  # 计算响应时间，毫秒为单位
@@ -2047,7 +1906,7 @@ async def chat_with_agent_api(
                             file_content = file.text_content
                         else:
                             # 尝试从MinIO获取文件内容
-                            from app.core.minio_client import get_file_stream, RAW_BUCKET
+                            from app.core.minio_client import get_file_stream
                             
                             try:
                                 # 从路径中提取bucket和object_name
@@ -2270,7 +2129,7 @@ async def get_agent_chat_logs(
         )
     
     # 查询所有会话ID
-    from sqlalchemy import distinct, func
+    from sqlalchemy import func
     session_query = db.query(
         AgentChatHistory.session_id,
         func.max(AgentChatHistory.created_at).label("last_message"),
@@ -2403,168 +2262,3 @@ async def share_chat_with_agent(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"聊天处理失败: {str(e)}"
         )   
-# @router.post("/{agent_id}/share-chat/{share_id}/chat")
-# async def share_chat_with_agent(
-#     agent_id: str,
-#     share_id: str,
-#     request_data: dict = Body(...),
-#     db: Session = Depends(get_db),
-#     user_id: Optional[str] = Query("000000", description="用户ID，默认为000000表示游客"),
-# ):
-#     """
-#     通过分享链接与智能体对话
-#     """
-#     print("share_chat_with_agent:::", request_data)
-#     # 验证分享链接是否有效
-#     share_token = db.query(AgentShareToken).filter(
-#         AgentShareToken.token == share_id,
-#         AgentShareToken.is_active == True
-#     ).first()
-    
-#     if not share_token:
-#         raise HTTPException(
-#             status_code=status.HTTP_404_NOT_FOUND,
-#             detail="分享链接不存在或已失效"
-#         )
-    
-#     # 验证智能体是否存在
-#     agent = db.query(Agent).filter(Agent.id == agent_id).first()
-#     if not agent:
-#         raise HTTPException(
-#             status_code=status.HTTP_404_NOT_FOUND,
-#             detail="智能体不存在"
-#         )
-    
-#     # 验证分享功能是否启用
-#     if not agent.share_enabled:
-#         raise HTTPException(
-#             status_code=status.HTTP_403_FORBIDDEN,
-#             detail="该智能体未启用分享功能"
-#         )
-    
-#     # 获取请求数据
-#     message = request_data.get("message", "")
-#     session_id = request_data.get("session_id", f"share_{int(time.time())}")
-    
-#     if not message:
-#         raise HTTPException(
-#             status_code=status.HTTP_400_BAD_REQUEST,
-#             detail="消息内容不能为空"
-#         )
-    
-#     try:
-#         # 获取模型
-#         model_id = agent.model_id
-#         if not model_id:
-#             raise HTTPException(
-#                 status_code=status.HTTP_400_BAD_REQUEST,
-#                 detail="该智能体未关联模型"
-#             )
-        
-#         model = agent_utils.get_model(db, model_id)
-#         if not model:
-#             raise HTTPException(
-#                 status_code=status.HTTP_400_BAD_REQUEST,
-#                 detail=f"模型不存在: {model_id}"
-#             )
-        
-#         # 记录开始时间
-#         start_time = time.time()
-        
-#         # 构建系统提示词
-#         system_prompt = agent.system_prompt or "你是一个智能助手，请回答用户的问题。"
-        
-#         # 构建消息列表
-#         messages = [
-#             {"role": "system", "content": system_prompt},
-#             {"role": "user", "content": message}
-#         ]
-#         # 准备模型参数
-#         model_params = {
-#             "messages": messages,
-#             "stream": False
-#         }
-        
-#         # 添加配置参数
-#         config = agent.config or {}
-#         if "temperature" in config:
-#             model_params["temperature"] = float(config["temperature"])
-#         if "max_tokens" in config:
-#             model_params["max_tokens"] = int(config["max_tokens"])
-#         if "top_p" in config:
-#             model_params["top_p"] = float(config["top_p"])
-#         if "frequency_penalty" in config:
-#             model_params["frequency_penalty"] = float(config["frequency_penalty"])
-        
-#         # 调用模型
-#         return await agent_utils.execute_model_inference(db, model_id, model_params)
-#     except Exception as e:
-#         print(f"分享聊天处理失败: {e}")
-#         traceback.print_exc()
-#         raise HTTPException(
-#             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-#             detail=f"处理失败: {str(e)}"
-#         )
-#         # print("response:::", response)
-# #         # 提取响应内容
-# #         response_content = ""
-# #         used_tokens = 0
-        
-# #         if isinstance(response, dict):
-# #             if "choices" in response and len(response["choices"]) > 0:
-# #                 choice = response["choices"][0]
-# #                 if "message" in choice and "content" in choice["message"]:
-# #                     response_content = choice["message"]["content"]
-            
-# #             if "usage" in response and "total_tokens" in response["usage"]:
-# #                 used_tokens = response["usage"]["total_tokens"]
-        
-# #         # 计算响应时间
-# #         response_time = int((time.time() - start_time) * 1000)  # 毫秒
-        
-# #         # 准备额外数据
-# #         extra_data = {
-# #             "tokens_used": used_tokens
-# #         }
-        
-# #         # 创建聊天历史记录
-# #         try:
-# #             agent_utils.create_chat_history(
-# #                 db=db,
-# #                 agent_id=agent_id,
-# #                 session_id=session_id,
-# #                 user_id=user_id,  # 使用传入的user_id
-# #                 user_message=message,
-# #                 agent_response=response_content,
-# #                 tokens_used=used_tokens,
-# #                 response_time=response_time,
-# #                 extra_data=extra_data,
-# #                 access_type="share",
-# #                 share_token_id=share_id,
-# #                 model_id=model_id  # 添加模型ID
-# #             )
-# #         except Exception as e:
-# #             print(f"记录聊天历史失败: {e}")
-# #             traceback.print_exc()
-        
-# #         # 更新分享Token的使用次数和最后使用时间
-# #         share_token.usage_count += 1
-# #         share_token.last_used_at = datetime.now()
-# #         db.commit()
-        
-# #         # 返回响应
-# #         return {
-# #             "message": response_content,
-# #             "tokens_used": used_tokens,
-# #             "response_time_ms": response_time
-# #         }
-        
-# #     except Exception as e:
-# #         print(f"分享聊天处理失败: {e}")
-# #         traceback.print_exc()
-# #         raise HTTPException(
-# #             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-# #             detail=f"处理失败: {str(e)}"
-# #         )
-        
-        
