@@ -33,6 +33,10 @@ from app.services.chat_orchestration_service import (
     McpOrchestrationService,
     ChatResponseService,
     GraphRetrievalService,
+    StrategyContext,
+    WebSearchStrategy,
+    KnowledgeRetrievalStrategy,
+    GraphRetrievalStrategy,
 )
 
 router = APIRouter()
@@ -396,27 +400,37 @@ async def chat_with_agent(
                 memory.add_system_prompt(agent.system_prompt)
                 final_messages = memory.messages()
             
-            retrieval_result = await retrieval_service.run(memory, db, agent, user_message, config)
-            for event_item in retrieval_result.events:
-                yield {
-                    "event": event_item["event"],
-                    "data": json.dumps(event_item["data"], ensure_ascii=False),
-                }
-                time.sleep(event_item.get("sleep", 0.1))
-            if retrieval_result.sources:
-                sources.extend(retrieval_result.sources)
-            if retrieval_result.web_search_results:
-                web_search_results = retrieval_result.web_search_results
-            final_messages = memory.messages()
-            
-            async for graph_event in graph_service.stream_graph_events(
+            strategy_context = StrategyContext(
+                memory=memory,
                 db=db,
                 agent=agent,
                 user_message=user_message,
                 model_id=model_id,
-            ):
-                yield {"event": graph_event["event"], "data": graph_event["data"]}
-                time.sleep(graph_event.get("sleep", 0.1))
+                config=config,
+            )
+            active_strategies = []
+            if agent.enable_web_search:
+                active_strategies.append(WebSearchStrategy(retrieval_service))
+            if agent.knowledge_bases:
+                active_strategies.append(KnowledgeRetrievalStrategy(retrieval_service))
+            if agent.graphs:
+                active_strategies.append(GraphRetrievalStrategy(graph_service))
+
+            for strategy in active_strategies:
+                strategy_result = await strategy.execute(strategy_context)
+                for event_item in strategy_result.events:
+                    data_payload = (
+                        event_item["data"]
+                        if isinstance(event_item["data"], str)
+                        else json.dumps(event_item["data"], ensure_ascii=False)
+                    )
+                    yield {"event": event_item["event"], "data": data_payload}
+                    time.sleep(event_item.get("sleep", 0.1))
+                if strategy_result.sources:
+                    sources.extend(strategy_result.sources)
+                if strategy_result.web_search_results:
+                    web_search_results = strategy_result.web_search_results
+            final_messages = memory.messages()
             
             # 添加历史消息和当前用户消息
             history_messages = [

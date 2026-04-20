@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, AsyncGenerator
+from abc import ABC, abstractmethod
 import os
 import tempfile
 import json
@@ -185,6 +186,28 @@ class RetrievalAugmentationService:
     ) -> RetrievalAugmentationResult:
         result = RetrievalAugmentationResult()
         await self._run_web_search(memory, agent, user_message, result)
+        await self._run_knowledge_retrieval(memory, db, agent, user_message, config, result)
+        return result
+
+    async def run_web_search_only(
+        self,
+        memory: Any,
+        agent: Any,
+        user_message: str,
+    ) -> RetrievalAugmentationResult:
+        result = RetrievalAugmentationResult()
+        await self._run_web_search(memory, agent, user_message, result)
+        return result
+
+    async def run_knowledge_retrieval_only(
+        self,
+        memory: Any,
+        db: Session,
+        agent: Any,
+        user_message: str,
+        config: Dict[str, Any],
+    ) -> RetrievalAugmentationResult:
+        result = RetrievalAugmentationResult()
         await self._run_knowledge_retrieval(memory, db, agent, user_message, config, result)
         return result
 
@@ -764,6 +787,12 @@ class GraphRetrievalService:
                 "sleep": 0.1,
             }
 
+    async def run(self, db: Session, agent: Any, user_message: str, model_id: str) -> List[Dict[str, Any]]:
+        events: List[Dict[str, Any]] = []
+        async for item in self.stream_graph_events(db=db, agent=agent, user_message=user_message, model_id=model_id):
+            events.append(item)
+        return events
+
     @staticmethod
     def _extract_cypher(extraction_result: Any, user_message: str, subgraph_name: str) -> Optional[str]:
         subgraph_id = (subgraph_name or "").lower().replace(" ", "_").replace("-", "_")
@@ -853,3 +882,76 @@ class GraphRetrievalService:
                         "properties": dict(value.properties) if hasattr(value, "properties") else {},
                     }
         return {"nodes": list(nodes.values()), "links": list(links.values())}
+
+
+@dataclass
+class StrategyContext:
+    memory: Any
+    db: Session
+    agent: Any
+    user_message: str
+    model_id: str
+    config: Dict[str, Any]
+
+
+@dataclass
+class StrategyResult:
+    events: List[Dict[str, Any]] = field(default_factory=list)
+    sources: List[Dict[str, Any]] = field(default_factory=list)
+    web_search_results: List[Dict[str, Any]] = field(default_factory=list)
+
+
+class BaseEnhancementStrategy(ABC):
+    @abstractmethod
+    async def execute(self, context: StrategyContext) -> StrategyResult:
+        raise NotImplementedError
+
+
+class WebSearchStrategy(BaseEnhancementStrategy):
+    def __init__(self, retrieval_service: RetrievalAugmentationService):
+        self.retrieval_service = retrieval_service
+
+    async def execute(self, context: StrategyContext) -> StrategyResult:
+        result = await self.retrieval_service.run_web_search_only(
+            memory=context.memory,
+            agent=context.agent,
+            user_message=context.user_message,
+        )
+        return StrategyResult(
+            events=result.events,
+            sources=result.sources,
+            web_search_results=result.web_search_results,
+        )
+
+
+class KnowledgeRetrievalStrategy(BaseEnhancementStrategy):
+    def __init__(self, retrieval_service: RetrievalAugmentationService):
+        self.retrieval_service = retrieval_service
+
+    async def execute(self, context: StrategyContext) -> StrategyResult:
+        result = await self.retrieval_service.run_knowledge_retrieval_only(
+            memory=context.memory,
+            db=context.db,
+            agent=context.agent,
+            user_message=context.user_message,
+            config=context.config,
+        )
+        return StrategyResult(
+            events=result.events,
+            sources=result.sources,
+            web_search_results=result.web_search_results,
+        )
+
+
+class GraphRetrievalStrategy(BaseEnhancementStrategy):
+    def __init__(self, graph_service: GraphRetrievalService):
+        self.graph_service = graph_service
+
+    async def execute(self, context: StrategyContext) -> StrategyResult:
+        events = await self.graph_service.run(
+            db=context.db,
+            agent=context.agent,
+            user_message=context.user_message,
+            model_id=context.model_id,
+        )
+        return StrategyResult(events=events)
