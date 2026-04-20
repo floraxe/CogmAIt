@@ -1,6 +1,5 @@
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, AsyncGenerator
-from abc import ABC, abstractmethod
 import os
 import tempfile
 import json
@@ -21,6 +20,11 @@ from app.utils.llm_knowledge_extractor import LLMKnowledgeExtractor
 from app.utils.neo4j_utils import get_neo4j_service
 from app.utils.config import get_neo4j_config
 from app.utils import agent as agent_utils
+from app.services.strategy_base import (
+    BaseRetrievalStrategy,
+    StrategyContext,
+    StrategyResult,
+)
 
 
 @dataclass
@@ -884,30 +888,7 @@ class GraphRetrievalService:
         return {"nodes": list(nodes.values()), "links": list(links.values())}
 
 
-@dataclass
-class StrategyContext:
-    memory: Any
-    db: Session
-    agent: Any
-    user_message: str
-    model_id: str
-    config: Dict[str, Any]
-
-
-@dataclass
-class StrategyResult:
-    events: List[Dict[str, Any]] = field(default_factory=list)
-    sources: List[Dict[str, Any]] = field(default_factory=list)
-    web_search_results: List[Dict[str, Any]] = field(default_factory=list)
-
-
-class BaseEnhancementStrategy(ABC):
-    @abstractmethod
-    async def execute(self, context: StrategyContext) -> StrategyResult:
-        raise NotImplementedError
-
-
-class WebSearchStrategy(BaseEnhancementStrategy):
+class WebSearchStrategy(BaseRetrievalStrategy):
     def __init__(self, retrieval_service: RetrievalAugmentationService):
         self.retrieval_service = retrieval_service
 
@@ -924,7 +905,7 @@ class WebSearchStrategy(BaseEnhancementStrategy):
         )
 
 
-class KnowledgeRetrievalStrategy(BaseEnhancementStrategy):
+class KnowledgeRetrievalStrategy(BaseRetrievalStrategy):
     def __init__(self, retrieval_service: RetrievalAugmentationService):
         self.retrieval_service = retrieval_service
 
@@ -943,7 +924,7 @@ class KnowledgeRetrievalStrategy(BaseEnhancementStrategy):
         )
 
 
-class GraphRetrievalStrategy(BaseEnhancementStrategy):
+class GraphRetrievalStrategy(BaseRetrievalStrategy):
     def __init__(self, graph_service: GraphRetrievalService):
         self.graph_service = graph_service
 

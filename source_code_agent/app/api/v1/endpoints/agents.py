@@ -33,11 +33,11 @@ from app.services.chat_orchestration_service import (
     McpOrchestrationService,
     ChatResponseService,
     GraphRetrievalService,
-    StrategyContext,
     WebSearchStrategy,
     KnowledgeRetrievalStrategy,
     GraphRetrievalStrategy,
 )
+from app.services.strategy_base import StrategyContext
 
 router = APIRouter()
 
