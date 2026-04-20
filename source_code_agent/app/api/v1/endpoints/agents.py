@@ -33,6 +33,8 @@ from app.services.chat_orchestration_service import (
     DocumentContextService,
     ModelInferenceService,
     RetrievalAugmentationService,
+    McpOrchestrationService,
+    ChatResponseService,
 )
 
 router = APIRouter()
@@ -317,12 +319,6 @@ async def chat_with_agent(
                 time.sleep(0.1)
                 return
                 
-            # 获取关联的MCP服务
-            mcp_services = []
-            if hasattr(agent, "mcp_services") and agent.mcp_services:
-                for service in agent.mcp_services:
-                    mcp_services.append(service)
-            
             if not user_message:
                 yield {"event": "error", "data": json.dumps({"error": "请求中缺少用户消息"}, ensure_ascii=False)}
                 time.sleep(0.1)
@@ -364,6 +360,8 @@ async def chat_with_agent(
             document_service = DocumentContextService()
             inference_service = ModelInferenceService()
             retrieval_service = RetrievalAugmentationService()
+            mcp_service = McpOrchestrationService()
+            response_service = ChatResponseService()
             processed_file_contents = []  # 存储处理后的文件内容
             has_file_content = False  # 标记是否有文件内容
             
@@ -1093,157 +1091,22 @@ async def chat_with_agent(
             for i, msg in enumerate(final_messages):
                 print(f"消息 {i+1} - 角色: {msg['role']}, 内容: {msg['content'][:100]}...")
             
-            # 处理MCP服务
-            if mcp_services and len(mcp_services) > 0:
-                try:
-                    # 通知前端正在处理MCP服务
-                    yield {"event": "mcp_processing", "data": json.dumps({"object": "chat.completion.mcp_processing", "status": "正在处理MCP服务请求"}, ensure_ascii=False)}
-                    time.sleep(0.1)
-                    
-                    # 导入MCP服务工具
-                    from app.utils.mcp import call_mcp_service, analyze_mcp_service_needs
-                    
-                    # 获取MCP服务列表
-                    mcp_service_list = []
-                    if hasattr(agent, "mcp_services") and agent.mcp_services:
-                        for service in agent.mcp_services:
-                            mcp_service_list.append(service)
-                    
-                    if mcp_service_list:
-                        # 分析用户消息，判断是否需要调用MCP服务
-                        print(f"开始分析用户消息是否需要调用MCP服务: {user_message[:50]}...")
-                        detection_result = await analyze_mcp_service_needs(
-                            db=db,
-                            model_id=model_id,
-                            user_message=user_message,
-                            available_services=mcp_service_list
-                        )
-                        
-                        print(f"MCP服务需求分析结果: {json.dumps(detection_result, ensure_ascii=False)}")
-                        
-                        # 如果检测到需要调用MCP服务
-                        if detection_result and detection_result.get("call_mcp", False):
-                            try:
-                                service_id = detection_result.get("service_id")
-                                function_name = detection_result.get("function_name")
-                                params = detection_result.get("params", {})
-                                
-                                if not service_id:
-                                    error_msg = "MCP服务ID为空"
-                                    print(error_msg)
-                                    yield {"event": "mcp_error", "data": json.dumps({
-                                        "object": "chat.completion.mcp_error",
-                                        "error": error_msg
-                                    }, ensure_ascii=False)}
-                                    return
-                                    
-                                if not function_name:
-                                    error_msg = "MCP函数名称为空"
-                                    print(error_msg)
-                                    yield {"event": "mcp_error", "data": json.dumps({
-                                        "object": "chat.completion.mcp_error",
-                                        "error": error_msg
-                                    }, ensure_ascii=False)}
-                                    return
-                                
-                                print(f"需要调用MCP服务: service_id={service_id}, function={function_name}, params={json.dumps(params, ensure_ascii=False)}")
-                                
-                                # 通知前端调用了哪个MCP服务
-                                yield {"event": "mcp_call", "data": json.dumps({
-                                    "object": "chat.completion.mcp_call",
-                                    "service_id": service_id,
-                                    "function_name": function_name,
-                                    "params": params
-                                }, ensure_ascii=False)}
-                                time.sleep(0.1)
-                                
-                                # 从关联的服务中查找指定服务
-                                service = next((s for s in mcp_service_list if s.id == service_id), None)
-                                
-                                if service:
-                                    # 获取当前用户ID，如果存在的话
-                                    # current_user_id = None
-                                    # if token:
-                                    #     # 如果是通过分享令牌访问，使用智能体所有者ID
-                                    #     current_user_id = agent.created_by
-                                    # else:
-                                    #     # 尝试获取当前登录用户ID
-                                    #     try:
-                                    #         # from app.api.deps import get_current_user_optional
-                                    #         current_user = await get_current_user_optional(db, token)
-                                    #         if current_user:
-                                    #             current_user_id = current_user.id
-                                    #     except:
-                                    #         # 如果无法获取当前用户，使用智能体所有者ID
-                                    #         current_user_id = agent.created_by
-
-                                    print(f"开始调用MCP服务: service_id={service_id}, function={function_name}, params={json.dumps(params, ensure_ascii=False)}")
-                                    
-                                    # 调用MCP服务
-                                    mcp_result = await call_mcp_service(
-                                        db=db,
-                                        service_id=service_id,
-                                        function_name=function_name,
-                                        params=params,
-                                        user_id=current_user_id
-                                    )
-                                    
-                                    print(f"MCP服务调用结果: {json.dumps(mcp_result, ensure_ascii=False)}")
-                                    
-                                    # 通知前端MCP服务调用结果
-                                    service_name = service.name if hasattr(service, 'name') else service.get('name', 'Unknown')
-                                    yield {"event": "mcp_result", "data": json.dumps({
-                                        "object": "chat.completion.mcp_result",
-                                        "service": service_name,
-                                        "function": function_name,
-                                        "result": mcp_result
-                                    }, ensure_ascii=False)}
-                                    time.sleep(0.1)
-                                    
-                                    # 将MCP服务结果添加到消息中
-                                    memory.add_tool_result(
-                                        f"以下是调用MCP服务 '{service_name}' 的函数 '{function_name}' 的结果，请使用这些结果回答用户的问题:\n\n```json\n{json.dumps(mcp_result, ensure_ascii=False, indent=2)}\n```"
-                                    )
-                                    final_messages = memory.messages()
-                                else:
-                                    error_msg = f"请求的MCP服务ID {service_id} 不在当前智能体关联的服务列表中"
-                                    print(error_msg)
-                                    yield {"event": "mcp_error", "data": json.dumps({
-                                        "object": "chat.completion.mcp_error",
-                                        "error": error_msg
-                                    }, ensure_ascii=False)}
-                            except Exception as e:
-                                error_msg = f"处理MCP服务调用时出错: {str(e)}"
-                                print(error_msg)
-                                import traceback
-                                traceback.print_exc()
-                                yield {"event": "mcp_error", "data": json.dumps({
-                                    "object": "chat.completion.mcp_error",
-                                    "error": error_msg
-                                }, ensure_ascii=False)}
-                        else:
-                            reason = detection_result.get('reason', '无原因')
-                            print(f"分析结果表明不需要调用MCP服务: {reason}")
-                            # 如果是由于解析失败导致的，通知前端
-                            if "无法解析" in reason or "解析错误" in reason or "解析失败" in reason or "解析JSON" in reason:
-                                yield {"event": "mcp_error", "data": json.dumps({
-                                    "object": "chat.completion.mcp_error",
-                                    "error": f"解析MCP服务需求失败: {reason}"
-                                }, ensure_ascii=False)}
-                    else:
-                        print(f"当前智能体没有关联的MCP服务")
-                        yield {"event": "mcp_error", "data": json.dumps({
-                            "object": "chat.completion.mcp_error",
-                            "error": "当前智能体没有关联的MCP服务"
-                        }, ensure_ascii=False)}
-                except Exception as e:
-                    print(f"处理MCP服务时出错: {e}")
-                    traceback.print_exc()
-                    # 通知前端MCP服务处理错误
-                    yield {"event": "mcp_error", "data": json.dumps({
-                        "object": "chat.completion.mcp_error",
-                        "error": f"处理MCP服务时出错: {str(e)}"
-                    }, ensure_ascii=False)}
+            mcp_result = await mcp_service.run(
+                db=db,
+                agent=agent,
+                user_message=user_message,
+                model_id=model_id,
+                current_user_id=current_user_id,
+            )
+            for event_item in mcp_result.events:
+                yield {
+                    "event": event_item["event"],
+                    "data": json.dumps(event_item["data"], ensure_ascii=False),
+                }
+                time.sleep(event_item.get("sleep", 0.1))
+            if mcp_result.tool_result_prompt:
+                memory.add_tool_result(mcp_result.tool_result_prompt)
+                final_messages = memory.messages()
             
             # 调用大模型
             inference_start = time.time()
@@ -1266,31 +1129,14 @@ async def chat_with_agent(
             yield {"event": "answer", "data": '{"object": "chat.completion.answer", "status": "AI开始生成答案"}'}
             time.sleep(0.1)
             
-            # 检查是否有文件内容相关的消息，如果有，添加额外的指导消息
-            has_file_content = any("以下是用户上传的文件内容" in msg.get("content", "") for msg in final_messages if msg.get("role") == "system")
-            print(f"是否有文件内容: {has_file_content}, 用户消息: {user_message}")
-            print(f"最终消息列表: {[msg.get('role') for msg in final_messages]}")
-            
-            # 如果没有检测到文件内容但有文件ID，强制添加一个提示
-            if not has_file_content and file_ids:
-                print(f"未检测到文件内容但有文件ID，强制添加文件内容提示")
-                fallback_contexts = await document_service.load_plain_text_contexts(db, file_ids)
-                fallback_system_context = document_service.build_system_context(fallback_contexts)
-                if fallback_system_context:
-                    memory.prepend_context(fallback_system_context)
-                    final_messages = memory.messages()
-                    has_file_content = True
-                    print(f"强制添加文件内容到对话上下文: {fallback_system_context[:100]}...")
-            
-            if has_file_content and ("文档说的什么" in user_message or "文档说了什么" in user_message or "文件内容是什么" in user_message or "文件说了什么" in user_message or "文件说的什么" in user_message):
-                # 添加额外的系统消息，指导模型如何回答
-                guidance_message = {
-                    "role": "system",
-                    "content": "用户正在询问文件内容。请直接回答文件的内容是什么，不要回避或者说找不到相关信息。文件内容已经在之前的系统消息中提供。"
-                }
-                memory.add_system_prompt(guidance_message["content"])
-                final_messages = memory.messages()
-                print("添加了额外的指导消息，引导模型回答文件内容相关问题")
+            final_messages, has_file_content = await response_service.ensure_file_guidance(
+                memory=memory,
+                final_messages=final_messages,
+                file_ids=file_ids,
+                db=db,
+                document_service=document_service,
+                user_message=user_message,
+            )
             
             # 调用大模型生成回答
             model_payload = inference_service.build_stream_payload(final_messages, config)
@@ -1336,19 +1182,13 @@ async def chat_with_agent(
                 #     except Exception as e:
                 #         print(f"获取当前用户信息失败: {e}")
                         
-                # 构建额外数据
-                extra_data = {
-                    "response_time_ms": response_time,
-                    "tokens_used": used_tokens
-                }
-                
-                # 添加知识库、网络搜索和资源引用信息（如果有）
-                if sources:
-                    extra_data["sources"] = sources
-                if web_search_results:
-                    extra_data["web_results"] = web_search_results
-                if has_file_content:
-                    extra_data["has_file_content"] = True
+                extra_data = response_service.build_extra_data(
+                    response_time=response_time,
+                    used_tokens=used_tokens,
+                    sources=sources,
+                    web_search_results=web_search_results,
+                    has_file_content=has_file_content,
+                )
                 
                 # 创建聊天历史记录，记录下使用的模型ID
                 try:

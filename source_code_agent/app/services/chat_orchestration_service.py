@@ -385,3 +385,188 @@ class RetrievalAugmentationService:
                 "sleep": 0.5,
             }
         )
+
+
+@dataclass
+class McpOrchestrationResult:
+    events: List[Dict[str, Any]] = field(default_factory=list)
+    tool_result_prompt: Optional[str] = None
+
+
+class McpOrchestrationService:
+    async def run(
+        self,
+        db: Session,
+        agent: Any,
+        user_message: str,
+        model_id: str,
+        current_user_id: str,
+    ) -> McpOrchestrationResult:
+        result = McpOrchestrationResult()
+        mcp_service_list = list(getattr(agent, "mcp_services", []) or [])
+        if not mcp_service_list:
+            return result
+
+        result.events.append(
+            {
+                "event": "mcp_processing",
+                "data": {"object": "chat.completion.mcp_processing", "status": "正在处理MCP服务请求"},
+                "sleep": 0.1,
+            }
+        )
+
+        try:
+            from app.utils.mcp import call_mcp_service, analyze_mcp_service_needs
+
+            detection_result = await analyze_mcp_service_needs(
+                db=db,
+                model_id=model_id,
+                user_message=user_message,
+                available_services=mcp_service_list,
+            )
+            if not detection_result or not detection_result.get("call_mcp", False):
+                reason = (detection_result or {}).get("reason", "无原因")
+                if any(key in reason for key in ["无法解析", "解析错误", "解析失败", "解析JSON"]):
+                    result.events.append(
+                        {
+                            "event": "mcp_error",
+                            "data": {
+                                "object": "chat.completion.mcp_error",
+                                "error": f"解析MCP服务需求失败: {reason}",
+                            },
+                            "sleep": 0.1,
+                        }
+                    )
+                return result
+
+            service_id = detection_result.get("service_id")
+            function_name = detection_result.get("function_name")
+            params = detection_result.get("params", {})
+            if not service_id or not function_name:
+                result.events.append(
+                    {
+                        "event": "mcp_error",
+                        "data": {
+                            "object": "chat.completion.mcp_error",
+                            "error": "MCP服务ID或函数名称为空",
+                        },
+                        "sleep": 0.1,
+                    }
+                )
+                return result
+
+            result.events.append(
+                {
+                    "event": "mcp_call",
+                    "data": {
+                        "object": "chat.completion.mcp_call",
+                        "service_id": service_id,
+                        "function_name": function_name,
+                        "params": params,
+                    },
+                    "sleep": 0.1,
+                }
+            )
+
+            service = next((svc for svc in mcp_service_list if svc.id == service_id), None)
+            if not service:
+                result.events.append(
+                    {
+                        "event": "mcp_error",
+                        "data": {
+                            "object": "chat.completion.mcp_error",
+                            "error": f"请求的MCP服务ID {service_id} 不在当前智能体关联的服务列表中",
+                        },
+                        "sleep": 0.1,
+                    }
+                )
+                return result
+
+            mcp_result = await call_mcp_service(
+                db=db,
+                service_id=service_id,
+                function_name=function_name,
+                params=params,
+                user_id=current_user_id,
+            )
+            service_name = service.name if hasattr(service, "name") else service.get("name", "Unknown")
+            result.events.append(
+                {
+                    "event": "mcp_result",
+                    "data": {
+                        "object": "chat.completion.mcp_result",
+                        "service": service_name,
+                        "function": function_name,
+                        "result": mcp_result,
+                    },
+                    "sleep": 0.1,
+                }
+            )
+            result.tool_result_prompt = (
+                f"以下是调用MCP服务 '{service_name}' 的函数 '{function_name}' 的结果，请使用这些结果回答用户的问题:\n\n"
+                f"```json\n{json.dumps(mcp_result, ensure_ascii=False, indent=2)}\n```"
+            )
+            return result
+        except Exception as exc:
+            result.events.append(
+                {
+                    "event": "mcp_error",
+                    "data": {"object": "chat.completion.mcp_error", "error": f"处理MCP服务时出错: {str(exc)}"},
+                    "sleep": 0.1,
+                }
+            )
+            return result
+
+
+class ChatResponseService:
+    @staticmethod
+    async def ensure_file_guidance(
+        memory: Any,
+        final_messages: List[Dict[str, Any]],
+        file_ids: List[str],
+        db: Session,
+        document_service: DocumentContextService,
+        user_message: str,
+    ) -> Tuple[List[Dict[str, Any]], bool]:
+        has_file_content = any(
+            "以下是用户上传的文件内容" in msg.get("content", "")
+            for msg in final_messages
+            if msg.get("role") == "system"
+        )
+        if not has_file_content and file_ids:
+            fallback_contexts = await document_service.load_plain_text_contexts(db, file_ids)
+            fallback_system_context = document_service.build_system_context(fallback_contexts)
+            if fallback_system_context:
+                memory.prepend_context(fallback_system_context)
+                has_file_content = True
+                final_messages = memory.messages()
+
+        if has_file_content and any(
+            key in user_message
+            for key in ["文档说的什么", "文档说了什么", "文件内容是什么", "文件说了什么", "文件说的什么"]
+        ):
+            memory.add_system_prompt(
+                "用户正在询问文件内容。请直接回答文件的内容是什么，不要回避或者说找不到相关信息。文件内容已经在之前的系统消息中提供。"
+            )
+            final_messages = memory.messages()
+        return final_messages, has_file_content
+
+    @staticmethod
+    def build_extra_data(
+        response_time: int,
+        used_tokens: int,
+        sources: List[Dict[str, Any]],
+        web_search_results: List[Dict[str, Any]],
+        has_file_content: bool,
+    ) -> Dict[str, Any]:
+        extra_data: Dict[str, Any] = {
+            "response_time_ms": response_time,
+            "tokens_used": used_tokens,
+        }
+        if sources:
+            extra_data["sources"] = sources
+        if web_search_results:
+            extra_data["web_results"] = web_search_results
+        if has_file_content:
+            extra_data["has_file_content"] = True
+        return extra_data
