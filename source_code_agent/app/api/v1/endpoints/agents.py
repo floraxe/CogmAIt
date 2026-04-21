@@ -41,6 +41,26 @@ from app.services.strategy_base import StrategyContext
 
 router = APIRouter()
 
+
+def _resolve_agent_access(db: Session, agent_id: str, token: Optional[str]):
+    """解析聊天访问目标智能体与访问类型。"""
+    if token:
+        agent = agent_utils.get_agent_by_share_token(db, token)
+        if not agent:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="分享令牌无效或已禁用"
+            )
+        return agent, agent.id, True
+
+    agent = agent_utils.get_agent(db=db, agent_id=agent_id)
+    if not agent:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="智能体不存在"
+        )
+    return agent, agent_id, False
+
 @router.get("/", response_model=AgentListResponse)
 async def get_agents(
     db: Session = Depends(get_db),
@@ -259,38 +279,8 @@ async def chat_with_agent(
     logger.debug(f"chat_with_agent接收到的请求: agent_id={agent_id}, user_id={user_id}")
     logger.debug(f"file_ids字段值: {chat_request.file_ids}")
     
-    # 验证访问权限
-    agent = None
-    is_share_access = False
     current_user_id = user_id  # 直接使用传入的user_id
-    
-    # 如果有token，验证是否是有效的分享令牌
-    if token:
-        agent = agent_utils.get_agent_by_share_token(db, token)
-        if agent:
-            is_share_access = True
-            agent_id = agent.id  # 确保使用正确的agent_id
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="分享令牌无效或已禁用"
-            )
-    
-    # 如果还没获取agent，则通过agent_id获取
-    if not agent:
-        agent = agent_utils.get_agent(db=db, agent_id=agent_id)
-        if not agent:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="智能体不存在"
-            )
-    
-    # 确保在继续之前agent变量已经被正确初始化
-    if not agent:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="初始化智能体失败"
-        )
+    agent, agent_id, is_share_access = _resolve_agent_access(db, agent_id, token)
     
     # 创建异步生成器用于流式响应
     async def response_generator():
@@ -590,30 +580,21 @@ async def chat_with_agent(
             yield {"event": "done", "data": "[DONE]"}
             time.sleep(0.1)
     
-    try:
-        # 如果是流式请求，直接返回流式响应
-        if chat_request.stream:
-            return EventSourceResponse(
-                response_generator(),
-                media_type="text/event-stream",
-                headers={
-                    "X-Accel-Buffering": "no",
-                    "Content-Type": "text/event-stream",
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive"
-                }
-            )
-        
-
-    
-    except Exception as e:
-        print(f"聊天处理失败: {e}")
-        import traceback  # 确保在异常处理块内也能访问traceback
-        traceback.print_exc()
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"聊天处理失败: {str(e)}"
-        ) 
+    if chat_request.stream:
+        return EventSourceResponse(
+            response_generator(),
+            media_type="text/event-stream",
+            headers={
+                "X-Accel-Buffering": "no",
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive"
+            }
+        )
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="当前仅支持流式请求"
+    )
         
         
 @router.post("/{agent_id}/generate-share-token", response_model=Dict[str, str])
