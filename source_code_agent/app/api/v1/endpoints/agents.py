@@ -9,7 +9,6 @@ from sse_starlette.sse import EventSourceResponse
 
 # 配置日志
 logger = logging.getLogger(__name__)
-from app.utils.model import execute_model_inference
 from app.db.session import get_db
 from app.utils.deps import get_current_active_user
 from app.utils import agent as agent_utils
@@ -23,21 +22,12 @@ from app.schemas.agent import (
     AgentChatResponse
 )
 from app.utils import format_datetime  # 添加这行导入
-from app.models.agent import AgentChatHistory, AgentShareToken
-from app.domain.memory import MemoryManager
+from app.models.agent import AgentChatHistory
 from pydantic import ValidationError
 from app.services.chat_orchestration_service import (
-    DocumentContextService,
-    ModelInferenceService,
-    RetrievalAugmentationService,
-    McpOrchestrationService,
-    ChatResponseService,
-    GraphRetrievalService,
-    WebSearchStrategy,
-    KnowledgeRetrievalStrategy,
-    GraphRetrievalStrategy,
+    ChatPipelineOrchestrator,
+    ChatPipelineRequest,
 )
-from app.services.strategy_base import StrategyContext
 
 router = APIRouter()
 
@@ -90,218 +80,21 @@ async def _chat_orchestration_generator(
     share_token: Optional[str] = None,
     api_key_id: Optional[str] = None,
 ):
-    try:
-        yield {"event": "status", "data": json.dumps({"object": "chat.completion.status", "status": "开始处理请求"}, ensure_ascii=False)}
-        time.sleep(0.1)
-
-        messages = chat_request.messages
-        user_message = messages[-1].content if messages and messages[-1].role == "user" else ""
-        session_id = chat_request.session_id or f"session_{int(time.time())}"
-        config_override = chat_request.config or {}
-        file_ids = chat_request.file_ids or []
-
-        agent = agent_utils.get_agent(db, agent_id)
-        if not agent:
-            yield {"event": "error", "data": json.dumps({"error": "智能体不存在"}, ensure_ascii=False)}
-            time.sleep(0.1)
-            yield {"event": "done", "data": "[DONE]"}
-            time.sleep(0.1)
-            return
-
-        if not user_message:
-            yield {"event": "error", "data": json.dumps({"error": "请求中缺少用户消息"}, ensure_ascii=False)}
-            time.sleep(0.1)
-            yield {"event": "done", "data": "[DONE]"}
-            time.sleep(0.1)
-            return
-
-        model_id = agent.model_id
-        if not model_id:
-            yield {"event": "error", "data": json.dumps({"error": "该智能体未关联模型，请先在智能体设置中关联一个对话模型"}, ensure_ascii=False)}
-            time.sleep(0.1)
-            yield {"event": "done", "data": "[DONE]"}
-            time.sleep(0.1)
-            return
-
-        model = agent_utils.get_model(db, model_id)
-        if not model:
-            yield {"event": "error", "data": f'{{"error": "模型不存在: {model_id}"}}'}
-            time.sleep(0.1)
-            yield {"event": "done", "data": "[DONE]"}
-            time.sleep(0.1)
-            return
-
-        agent_config = agent.config or {}
-        config = {**agent_config, **config_override}
-        start_time = time.time()
-
-        response_content = ""
-        used_tokens = 0
-        sources = []
-        web_search_results = []
-        memory = MemoryManager()
-        final_messages = memory.messages()
-        document_service = DocumentContextService()
-        inference_service = ModelInferenceService()
-        retrieval_service = RetrievalAugmentationService()
-        mcp_service = McpOrchestrationService()
-        response_service = ChatResponseService()
-        graph_service = GraphRetrievalService()
-        has_file_content = False
-
-        if file_ids:
-            logger.info(f"开始处理文件，文件ID列表: {file_ids}")
-            yield {"event": "status", "data": json.dumps({"object": "chat.completion.status", "status": "正在处理上传文件"}, ensure_ascii=False)}
-            time.sleep(0.1)
-            file_context_result = await document_service.process_files(db, file_ids)
-            for status_msg in file_context_result.processed_messages:
-                yield {"event": "file_processing", "data": json.dumps({"status": status_msg}, ensure_ascii=False)}
-                time.sleep(0.1)
-            for error_msg in file_context_result.error_messages:
-                yield {"event": "file_processing", "data": json.dumps({"status": error_msg}, ensure_ascii=False)}
-                time.sleep(0.1)
-
-            file_system_context = document_service.build_system_context(file_context_result.formatted_contexts)
-            if file_system_context:
-                memory.prepend_context(file_system_context)
-                final_messages = memory.messages()
-                has_file_content = True
-
-        yield {"event": "think", "data": json.dumps({"object": "chat.completion.think", "status": "AI开始思考该如何回答您的问题"}, ensure_ascii=False)}
-        time.sleep(0.1)
-        if agent.system_prompt:
-            memory.add_system_prompt(agent.system_prompt)
-            final_messages = memory.messages()
-
-        strategy_context = StrategyContext(
-            memory=memory,
-            db=db,
-            agent=agent,
-            user_message=user_message,
-            model_id=model_id,
-            config=config,
-        )
-        active_strategies = []
-        if agent.enable_web_search:
-            active_strategies.append(WebSearchStrategy(retrieval_service))
-        if agent.knowledge_bases:
-            active_strategies.append(KnowledgeRetrievalStrategy(retrieval_service))
-        if agent.graphs:
-            active_strategies.append(GraphRetrievalStrategy(graph_service))
-
-        for strategy in active_strategies:
-            strategy_result = await strategy.execute(strategy_context)
-            for event_item in strategy_result.events:
-                data_payload = (
-                    event_item["data"]
-                    if isinstance(event_item["data"], str)
-                    else json.dumps(event_item["data"], ensure_ascii=False)
-                )
-                yield {"event": event_item["event"], "data": data_payload}
-                time.sleep(event_item.get("sleep", 0.1))
-            if strategy_result.sources:
-                sources.extend(strategy_result.sources)
-            if strategy_result.web_search_results:
-                web_search_results = strategy_result.web_search_results
-        final_messages = memory.messages()
-
-        history_messages = [
-            {"role": msg.role, "content": msg.content}
-            for msg in messages
-            if msg.role in ["user", "assistant", "system"]
-        ]
-        memory.add_history(history_messages)
-        final_messages = memory.messages()
-
-        mcp_result = await mcp_service.run(
-            db=db,
-            agent=agent,
-            user_message=user_message,
-            model_id=model_id,
-            current_user_id=current_user_id,
-        )
-        for event_item in mcp_result.events:
-            yield {"event": event_item["event"], "data": json.dumps(event_item["data"], ensure_ascii=False)}
-            time.sleep(event_item.get("sleep", 0.1))
-        if mcp_result.tool_result_prompt:
-            memory.add_tool_result(mcp_result.tool_result_prompt)
-            final_messages = memory.messages()
-
-        yield {"event": "reasoning", "data": '{"object": "chat.completion.reasoning", "status": "AI正在整合信息推理回答"}'}
-        time.sleep(0.1)
-        yield {"event": "info", "data": json.dumps({
-            "object": "chat.completion.info",
-            "sources": sources,
-            "web_search_results": web_search_results
-        }, ensure_ascii=False)}
-        time.sleep(0.1)
-        yield {"event": "answer", "data": '{"object": "chat.completion.answer", "status": "AI开始生成答案"}'}
-        time.sleep(0.1)
-
-        final_messages, has_file_content = await response_service.ensure_file_guidance(
-            memory=memory,
-            final_messages=final_messages,
-            file_ids=file_ids,
-            db=db,
-            document_service=document_service,
-            user_message=user_message,
-        )
-
-        model_payload = inference_service.build_stream_payload(final_messages, config)
-        model_response = await inference_service.run_stream(db, model_id, model_payload)
-        async for chunk in model_response:
-            event_name, event_data, delta_content = inference_service.normalize_stream_chunk(chunk)
-            if delta_content:
-                response_content += delta_content
-            yield {"event": event_name, "data": event_data}
-            if event_name in ["tool_calls", "tool_call_result"]:
-                time.sleep(0.1)
-
-        response_time = int((time.time() - start_time) * 1000)
-        share_token_id = None
-        if access_type == "share" and share_token:
-            share_token_obj = db.query(AgentShareToken).filter(AgentShareToken.token == share_token).first()
-            if share_token_obj:
-                share_token_id = share_token_obj.id
-
-        extra_data = response_service.build_extra_data(
-            response_time=response_time,
-            used_tokens=used_tokens,
-            sources=sources,
-            web_search_results=web_search_results,
-            has_file_content=has_file_content,
-        )
-        try:
-            agent_utils.create_chat_history(
-                db=db,
-                agent_id=agent_id,
-                session_id=session_id,
-                user_id=current_user_id,
-                user_message=user_message,
-                agent_response=response_content,
-                tokens_used=used_tokens,
-                response_time=response_time,
-                extra_data=extra_data,
-                access_type=access_type,
-                api_key_id=api_key_id,
-                share_token_id=share_token_id,
-                model_id=model_id,
-            )
-        except Exception as err:
-            print(f"记录聊天历史失败: {err}")
-            traceback.print_exc()
-
-        yield {"event": "status", "data": '{"object": "chat.completion.status", "status": "回答完成"}'}
-        time.sleep(0.1)
-        yield {"event": "done", "data": "[DONE]"}
-        time.sleep(0.1)
-    except Exception as e:
-        print(f"生成流式响应时出错: {e}")
-        traceback.print_exc()
-        yield {"event": "error", "data": json.dumps({"error": f"生成响应时出错: {str(e)}"})}
-        time.sleep(0.1)
-        yield {"event": "done", "data": "[DONE]"}
-        time.sleep(0.1)
+    orchestrator = ChatPipelineOrchestrator()
+    request = ChatPipelineRequest(
+        db=db,
+        agent_id=agent_id,
+        messages=chat_request.messages,
+        session_id=chat_request.session_id or f"session_{int(time.time())}",
+        config_override=chat_request.config or {},
+        file_ids=chat_request.file_ids or [],
+        current_user_id=current_user_id,
+        access_type=access_type,
+        share_token=share_token,
+        api_key_id=api_key_id,
+    )
+    async for event in orchestrator.stream(request):
+        yield event
 
 @router.get("/", response_model=AgentListResponse)
 async def get_agents(
