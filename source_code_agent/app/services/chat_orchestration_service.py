@@ -10,6 +10,8 @@ import re
 from sqlalchemy.orm import Session
 
 from app.models.file import File as FileModel
+from app.models.agent import AgentShareToken
+from app.domain.memory import MemoryManager
 from app.utils.file_processor import extract_text_from_file_path
 from app.core.minio_client import get_file_stream
 from app.utils.model import execute_model_inference
@@ -936,3 +938,243 @@ class GraphRetrievalStrategy(BaseRetrievalStrategy):
             model_id=context.model_id,
         )
         return StrategyResult(events=events)
+
+
+@dataclass
+class ChatPipelineRequest:
+    db: Session
+    agent_id: str
+    messages: List[Any]
+    session_id: str
+    config_override: Dict[str, Any]
+    file_ids: List[str]
+    current_user_id: str
+    access_type: str
+    share_token: Optional[str] = None
+    api_key_id: Optional[str] = None
+
+
+@dataclass
+class ChatPipelineState:
+    request: ChatPipelineRequest
+    agent: Any = None
+    model_id: str = ""
+    user_message: str = ""
+    config: Dict[str, Any] = field(default_factory=dict)
+    start_time: float = 0.0
+    response_content: str = ""
+    used_tokens: int = 0
+    sources: List[Dict[str, Any]] = field(default_factory=list)
+    web_search_results: List[Dict[str, Any]] = field(default_factory=list)
+    has_file_content: bool = False
+    share_token_id: Optional[str] = None
+    memory: Any = field(default_factory=lambda: None)
+    final_messages: List[Dict[str, Any]] = field(default_factory=list)
+
+
+class ChatPipelineOrchestrator:
+    def __init__(self):
+        self.document_service = DocumentContextService()
+        self.inference_service = ModelInferenceService()
+        self.retrieval_service = RetrievalAugmentationService()
+        self.mcp_service = McpOrchestrationService()
+        self.response_service = ChatResponseService()
+        self.graph_service = GraphRetrievalService()
+
+    async def stream(self, request: ChatPipelineRequest) -> AsyncGenerator[Dict[str, Any], None]:
+        state = ChatPipelineState(request=request)
+        try:
+            yield from_event("status", {"object": "chat.completion.status", "status": "开始处理请求"})
+            audit_events = await self._audit(state)
+            for event in audit_events:
+                yield event
+
+            strategy_events = await self._run_strategies(state)
+            for event in strategy_events:
+                yield event
+
+            async for event in self._run_inference(state):
+                yield event
+
+            filter_events = await self._run_filter(state)
+            for event in filter_events:
+                yield event
+        except Exception as exc:
+            traceback.print_exc()
+            yield {
+                "event": "error",
+                "data": json.dumps({"error": f"生成响应时出错: {str(exc)}"}, ensure_ascii=False),
+            }
+            time.sleep(0.1)
+            yield {"event": "done", "data": "[DONE]"}
+
+    async def _audit(self, state: ChatPipelineState) -> List[Dict[str, Any]]:
+        events: List[Dict[str, Any]] = []
+        request = state.request
+        state.user_message = (
+            request.messages[-1].content
+            if request.messages and request.messages[-1].role == "user"
+            else ""
+        )
+        state.agent = agent_utils.get_agent(request.db, request.agent_id)
+        if not state.agent:
+            raise ValueError("智能体不存在")
+        if not state.user_message:
+            raise ValueError("请求中缺少用户消息")
+
+        state.model_id = state.agent.model_id
+        if not state.model_id:
+            raise ValueError("该智能体未关联模型，请先在智能体设置中关联一个对话模型")
+        if not agent_utils.get_model(request.db, state.model_id):
+            raise ValueError(f"模型不存在: {state.model_id}")
+
+        state.config = {**(state.agent.config or {}), **request.config_override}
+        state.start_time = time.time()
+        state.memory = MemoryManager()
+        state.final_messages = state.memory.messages()
+
+        if request.file_ids:
+            events.append(from_event("status", {"object": "chat.completion.status", "status": "正在处理上传文件"}, sleep=0.1))
+            file_context_result = await self.document_service.process_files(request.db, request.file_ids)
+            for status_msg in file_context_result.processed_messages:
+                events.append(from_event("file_processing", {"status": status_msg}, sleep=0.1))
+            for error_msg in file_context_result.error_messages:
+                events.append(from_event("file_processing", {"status": error_msg}, sleep=0.1))
+            file_system_context = self.document_service.build_system_context(file_context_result.formatted_contexts)
+            if file_system_context:
+                state.memory.prepend_context(file_system_context)
+                state.final_messages = state.memory.messages()
+                state.has_file_content = True
+
+        if state.agent.system_prompt:
+            state.memory.add_system_prompt(state.agent.system_prompt)
+            state.final_messages = state.memory.messages()
+        return flatten_events(events)
+
+    async def _run_strategies(self, state: ChatPipelineState) -> List[Dict[str, Any]]:
+        events: List[Dict[str, Any]] = [from_event("think", {"object": "chat.completion.think", "status": "AI开始思考该如何回答您的问题"}, sleep=0.1)]
+        strategy_context = StrategyContext(
+            memory=state.memory,
+            db=state.request.db,
+            agent=state.agent,
+            user_message=state.user_message,
+            model_id=state.model_id,
+            config=state.config,
+        )
+        active_strategies: List[BaseRetrievalStrategy] = []
+        if state.agent.enable_web_search:
+            active_strategies.append(WebSearchStrategy(self.retrieval_service))
+        if state.agent.knowledge_bases:
+            active_strategies.append(KnowledgeRetrievalStrategy(self.retrieval_service))
+        if state.agent.graphs:
+            active_strategies.append(GraphRetrievalStrategy(self.graph_service))
+
+        for strategy in active_strategies:
+            strategy_result = await strategy.execute(strategy_context)
+            for item in strategy_result.events:
+                payload = item["data"] if isinstance(item["data"], str) else json.dumps(item["data"], ensure_ascii=False)
+                events.append({"event": item["event"], "data": payload})
+            if strategy_result.sources:
+                state.sources.extend(strategy_result.sources)
+            if strategy_result.web_search_results:
+                state.web_search_results = strategy_result.web_search_results
+
+        history_messages = [
+            {"role": msg.role, "content": msg.content}
+            for msg in state.request.messages
+            if msg.role in ["user", "assistant", "system"]
+        ]
+        state.memory.add_history(history_messages)
+        state.final_messages = state.memory.messages()
+        return events
+
+    async def _run_inference(self, state: ChatPipelineState) -> AsyncGenerator[Dict[str, Any], None]:
+        mcp_result = await self.mcp_service.run(
+            db=state.request.db,
+            agent=state.agent,
+            user_message=state.user_message,
+            model_id=state.model_id,
+            current_user_id=state.request.current_user_id,
+        )
+        for event_item in mcp_result.events:
+            yield {"event": event_item["event"], "data": json.dumps(event_item["data"], ensure_ascii=False)}
+            time.sleep(event_item.get("sleep", 0.1))
+        if mcp_result.tool_result_prompt:
+            state.memory.add_tool_result(mcp_result.tool_result_prompt)
+            state.final_messages = state.memory.messages()
+
+        yield {"event": "reasoning", "data": '{"object": "chat.completion.reasoning", "status": "AI正在整合信息推理回答"}'}
+        yield {
+            "event": "info",
+            "data": json.dumps(
+                {"object": "chat.completion.info", "sources": state.sources, "web_search_results": state.web_search_results},
+                ensure_ascii=False,
+            ),
+        }
+        yield {"event": "answer", "data": '{"object": "chat.completion.answer", "status": "AI开始生成答案"}'}
+
+        state.final_messages, state.has_file_content = await self.response_service.ensure_file_guidance(
+            memory=state.memory,
+            final_messages=state.final_messages,
+            file_ids=state.request.file_ids,
+            db=state.request.db,
+            document_service=self.document_service,
+            user_message=state.user_message,
+        )
+
+        payload = self.inference_service.build_stream_payload(state.final_messages, state.config)
+        model_response = await self.inference_service.run_stream(state.request.db, state.model_id, payload)
+        async for chunk in model_response:
+            event_name, event_data, delta_content = self.inference_service.normalize_stream_chunk(chunk)
+            if delta_content:
+                state.response_content += delta_content
+            yield {"event": event_name, "data": event_data}
+
+    async def _run_filter(self, state: ChatPipelineState) -> List[Dict[str, Any]]:
+        request = state.request
+        if request.access_type == "share" and request.share_token:
+            share_token_obj = request.db.query(AgentShareToken).filter(AgentShareToken.token == request.share_token).first()
+            if share_token_obj:
+                state.share_token_id = share_token_obj.id
+
+        response_time = int((time.time() - state.start_time) * 1000)
+        extra_data = self.response_service.build_extra_data(
+            response_time=response_time,
+            used_tokens=state.used_tokens,
+            sources=state.sources,
+            web_search_results=state.web_search_results,
+            has_file_content=state.has_file_content,
+        )
+        try:
+            agent_utils.create_chat_history(
+                db=request.db,
+                agent_id=request.agent_id,
+                session_id=request.session_id,
+                user_id=request.current_user_id,
+                user_message=state.user_message,
+                agent_response=state.response_content,
+                tokens_used=state.used_tokens,
+                response_time=response_time,
+                extra_data=extra_data,
+                access_type=request.access_type,
+                api_key_id=request.api_key_id,
+                share_token_id=state.share_token_id,
+                model_id=state.model_id,
+            )
+        except Exception:
+            traceback.print_exc()
+        return [
+            {"event": "status", "data": '{"object": "chat.completion.status", "status": "回答完成"}'},
+            {"event": "done", "data": "[DONE]"},
+        ]
+
+
+def from_event(event: str, data: Dict[str, Any], sleep: float = 0.1) -> Dict[str, Any]:
+    payload = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False)
+    item = {"event": event, "data": payload}
+    time.sleep(sleep)
+    return item
+
+
+def flatten_events(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [item for item in items if item]
