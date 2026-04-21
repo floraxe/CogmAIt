@@ -12,6 +12,8 @@
   "tests/domain/test_session_context.py::test_message_count_cannot_exceed_limit",
   "tests/domain/test_session_context.py::test_prepend_message_puts_message_at_beginning",
   "tests/domain/test_session_context.py::test_returned_messages_append_illegal_data_does_not_pollute_internal_state",
+  "tests/services/test_chat_pipeline_orchestrator.py::test_chat_pipeline_filter_persists_chat_history",
+  "tests/services/test_chat_pipeline_orchestrator.py::test_chat_pipeline_stream_contains_four_stage_key_events",
   "tests/services/test_enhancement_strategies.py::test_graph_strategy_execute_returns_unified_result",
   "tests/services/test_enhancement_strategies.py::test_knowledge_strategy_execute_returns_unified_result",
   "tests/services/test_enhancement_strategies.py::test_web_search_strategy_execute_returns_unified_result",
