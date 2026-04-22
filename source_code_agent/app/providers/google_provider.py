@@ -1,6 +1,13 @@
 import asyncio
 import time
+import warnings
 from typing import Dict, Any, Optional, List, Union, AsyncGenerator
+
+warnings.filterwarnings(
+    "ignore",
+    message=r".*All support for the `google\.generativeai` package has ended.*",
+    category=FutureWarning,
+)
 
 from google.generativeai import configure, GenerativeModel
 import google.generativeai as genai
