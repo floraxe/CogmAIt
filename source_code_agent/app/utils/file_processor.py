@@ -11,14 +11,98 @@ from datetime import datetime
 import uuid
 import pandas as pd
 import uuid
-from magic_pdf.data.data_reader_writer import FileBasedDataWriter, FileBasedDataReader
-from magic_pdf.data.dataset import PymuDocDataset
-from magic_pdf.model.doc_analyze_by_custom_model import doc_analyze
-from magic_pdf.config.enums import SupportedPdfParseMethod
-from magic_pdf.data.read_api import read_local_office, read_local_images
+from app.domain.knowledge_chunk import KnowledgeChunk
+
+# 使用PyPDF2替代magic_pdf
+try:
+    from pypdf import PdfReader
+    PYPDF_AVAILABLE = True
+except ImportError:
+    try:
+        # 兼容旧版本
+        from PyPDF2 import PdfReader
+        PYPDF_AVAILABLE = True
+    except ImportError:
+        PYPDF_AVAILABLE = False
 
 # 配置日志
 logger = logging.getLogger(__name__)
+
+def get_ocr_api_key() -> str:
+    """获取OCR API密钥"""
+    try:
+        from app.core.config import settings
+        return settings.OCR_SPACE_API_KEY or ""
+    except Exception:
+        return os.environ.get("OCR_SPACE_API_KEY", "")
+
+
+async def extract_text_from_pdf_simple(pdf_path: str) -> str:
+    """
+    使用PyPDF2提取PDF文本（替代MinerU）
+    如果PyPDF2无法提取，则调用OCR.space API
+    
+    Args:
+        pdf_path: PDF文件路径
+        
+    Returns:
+        提取的文本内容
+    """
+    try:
+        # 首先尝试使用PyPDF2提取文本
+        if PYPDF_AVAILABLE:
+            text = ""
+            try:
+                reader = PdfReader(pdf_path)
+                for page in reader.pages:
+                    page_text = page.extract_text()
+                    if page_text:
+                        text += page_text + "\n"
+                
+                # 如果成功提取到文本，返回
+                if text.strip():
+                    logger.info(f"成功使用PyPDF2提取PDF文本，长度: {len(text)}")
+                    return text
+            except Exception as e:
+                logger.warning(f"PyPDF2提取失败: {e}，尝试OCR")
+        
+        # 如果PyPDF2失败或提取不到文本，使用OCR.space API
+        ocr_key = get_ocr_api_key()
+        if ocr_key:
+            import aiohttp
+            
+            async with aiohttp.ClientSession() as session:
+                with open(pdf_path, 'rb') as f:
+                    data = aiohttp.FormData()
+                    data.add_field('file', f, filename=os.path.basename(pdf_path))
+                    data.add_field('apikey', ocr_key)
+                    data.add_field('language', 'chs')  # 中文识别
+                    data.add_field('isOverlayRequired', 'false')
+                    data.add_field('filetype', 'PDF')
+                    
+                    async with session.post('https://api.ocr.space/parse/image', data=data) as resp:
+                        result = await resp.json()
+                        
+                        if result.get('IsErroredOnProcessing'):
+                            error_msg = result.get('ErrorMessage', ['Unknown error'])[0]
+                            logger.error(f"OCR.space API错误: {error_msg}")
+                            return f"OCR提取失败: {error_msg}"
+                        
+                        # 提取文本
+                        text = ""
+                        if result.get('ParsedResults'):
+                            for parsed in result['ParsedResults']:
+                                text += parsed.get('ParsedText', '') + "\n"
+                        
+                        logger.info(f"成功使用OCR.space提取PDF文本，长度: {len(text)}")
+                        return text
+        else:
+            logger.warning("未配置OCR_SPACE_API_KEY，无法进行OCR识别")
+            return "PDF文本提取失败：PyPDF2无法提取且未配置OCR API"
+            
+    except Exception as e:
+        logger.error(f"PDF文本提取异常: {e}")
+        return f"提取PDF文本时出错: {str(e)}"
 
 
 async def analyze_image_with_model(image_path: str, model_id: str, db=None) -> Dict[str, Any]:
@@ -592,7 +676,7 @@ def process_file(file_path: str, output_dir: str = None,filename_uuid:str=None,k
         return {"error": f"处理文件时发生错误: {str(e)}", "file_path": file_path}
 
 
-async def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> List[str]:
+async def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> List[KnowledgeChunk]:
     """
     将文本分成重叠的块
     
@@ -602,12 +686,12 @@ async def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> L
         overlap (int): 块之间的重叠大小
         
     返回:
-        List[str]: 文本块列表
+        List[KnowledgeChunk]: 不可变知识块列表
     """
     if not text:
         return []
     
-    chunks = []
+    chunks: List[str] = []
     start = 0
     text_length = len(text)
     
@@ -636,7 +720,15 @@ async def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> L
         # 更新起始位置，考虑重叠
         start = max(start + chunk_size - overlap, end - overlap)
     
-    return chunks 
+    return [
+        KnowledgeChunk.from_parts(
+            text=chunk_text_item,
+            chunk_index=index,
+            total_chunks=len(chunks),
+            metadata={"source": "file_processor.chunk_text"},
+        )
+        for index, chunk_text_item in enumerate(chunks)
+    ]
 
 async def extract_text_from_file(file_path: str, file_type: str) -> str:
     """

@@ -6,24 +6,69 @@ import numpy as np
 from pathlib import Path
 import ast
 from sqlalchemy.orm import Session
+import asyncio
+
+# Pinecone向量数据库
+try:
+    from pinecone import Pinecone, ServerlessSpec
+    HAS_PINECONE = True
+except ImportError:
+    HAS_PINECONE = False
+    logging.warning("pinecone 模块导入失败，使用Pinecone功能请安装: poetry add pinecone")
+
+# Milvus（保留兼容）
 try:
     from pymilvus import MilvusClient
     HAS_PYMILVUS = True
 except ImportError:
     HAS_PYMILVUS = False
-    logging.warning("pymilvus 模块导入失败，向量存储功能将不可用。请使用 pip install pymilvus 安装。")
+    logging.debug("pymilvus 未安装，Milvus 相关功能不可用。")
 
-# 将 HAS_PYMILVUS 导出为模块变量，确保它可以被其他模块导入
-__all__ = ['MilvusVectorStore', 'EmbeddingManager', 'HAS_PYMILVUS']
+# 将模块变量导出
+__all__ = ['MilvusVectorStore', 'PineconeVectorStore', 'EmbeddingManager', 'HAS_PYMILVUS', 'HAS_PINECONE']
 
 from app.models.model import Model
 from app.utils.model import get_model
 from app.providers.manager import provider_manager
 from app.utils.chunker import TextChunker, ChunkingMethod
 from app.core.config import settings
+from app.domain.knowledge_chunk import KnowledgeChunk
 
 # 配置日志
 logger = logging.getLogger(__name__)
+
+
+ChunkLike = Union[KnowledgeChunk, Dict[str, Any]]
+
+
+def _chunk_text(chunk: ChunkLike) -> str:
+    if isinstance(chunk, KnowledgeChunk):
+        return chunk.text
+    return chunk.get("text", "")
+
+
+def _chunk_metadata(chunk: ChunkLike) -> Dict[str, Any]:
+    if isinstance(chunk, KnowledgeChunk):
+        return chunk.metadata
+    return chunk.get("metadata", {})
+
+# 延迟导入settings以避免循环导入
+def get_api_keys():
+    """获取API密钥配置"""
+    try:
+        from app.core.config import settings
+        return {
+            'openai': settings.OPENAI_API_KEY or "",
+            'pinecone': settings.PINECONE_API_KEY or "",
+            'pinecone_env': settings.PINECONE_ENVIRONMENT or "us-east-1"
+        }
+    except Exception as e:
+        logger.warning(f"获取配置失败，使用默认值: {e}")
+        return {
+            'openai': os.environ.get("OPENAI_API_KEY", ""),
+            'pinecone': os.environ.get("PINECONE_API_KEY", ""),
+            'pinecone_env': os.environ.get("PINECONE_ENVIRONMENT", "us-east-1")
+        }
 
 
 class MilvusVectorStore:
@@ -134,7 +179,7 @@ class MilvusVectorStore:
     def insert_vectors(self, 
                         knowledge_id: str, 
                         file_id: str,
-                        chunks: List[Dict[str, Any]], 
+                        chunks: List[ChunkLike], 
                         embeddings: List[List[float]]) -> bool:
         """
         插入向量
@@ -142,7 +187,7 @@ class MilvusVectorStore:
         参数:
             knowledge_id (str): 知识库ID
             file_id (str): 文件ID
-            chunks (List[Dict[str, Any]]): 文本块列表
+            chunks (List[ChunkLike]): 文本块列表
             embeddings (List[List[float]]): 嵌入向量列表
             
         返回:
@@ -164,7 +209,7 @@ class MilvusVectorStore:
             data = []
             for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
                 # 提取基本元数据
-                metadata = chunk.get("metadata", {})
+                metadata = _chunk_metadata(chunk)
                 
                 # 使用整数ID，将字符串ID转换为整数哈希值
                 chunk_id = hash(f"{file_id}_{i}") % (2**63)
@@ -172,7 +217,7 @@ class MilvusVectorStore:
                 data.append({
                     "id": chunk_id,  # 使用整数ID
                     "vector": embedding,
-                    "text": chunk["text"],
+                    "text": _chunk_text(chunk),
                     "file_id": file_id,
                     "chunk_index": i,
                     "knowledge_id": knowledge_id,
@@ -286,6 +331,179 @@ class MilvusVectorStore:
         except Exception as e:
             logger.error(f"搜索相似向量失败: {str(e)}")
             return []
+
+
+class PineconeVectorStore:
+    """
+    Pinecone云向量数据库存储类（替代本地FAISS/Milvus）
+    """
+    
+    def __init__(self, index_name_prefix: str = "knowledge-"):
+        """初始化Pinecone向量存储"""
+        self.index_name_prefix = index_name_prefix
+        self.pc = None
+        
+        if not HAS_PINECONE:
+            logger.warning("Pinecone未安装，请使用: pip install pinecone-client")
+            return
+        
+        # 获取API密钥
+        api_keys = get_api_keys()
+        pinecone_key = api_keys.get('pinecone', '')
+        
+        if not pinecone_key:
+            logger.warning("未配置PINECONE_API_KEY")
+            return
+        
+        try:
+            self.pc = Pinecone(api_key=pinecone_key)
+            logger.info("成功初始化Pinecone客户端")
+        except Exception as e:
+            logger.error(f"初始化Pinecone失败: {e}")
+    
+    def get_index_name(self, knowledge_id: str) -> str:
+        """获取知识库对应的索引名称"""
+        # Pinecone索引名只能包含小写字母、数字和连字符
+        return f"{self.index_name_prefix}{knowledge_id}".lower()
+    
+    def create_index(self, knowledge_id: str, dimension: int = 1536):
+        """创建Pinecone索引"""
+        if not self.pc:
+            return False
+            
+        try:
+            index_name = self.get_index_name(knowledge_id)
+            
+            # 检查索引是否已存在
+            existing_indexes = self.pc.list_indexes()
+            if index_name in [idx['name'] for idx in existing_indexes]:
+                logger.info(f"Pinecone索引已存在: {index_name}")
+                return True
+            
+            # 创建新索引（使用Serverless）
+            self.pc.create_index(
+                name=index_name,
+                dimension=dimension,
+                metric='cosine',
+                spec=ServerlessSpec(cloud='aws', region='us-east-1')
+            )
+            logger.info(f"成功创建Pinecone索引: {index_name}")
+            return True
+        except Exception as e:
+            logger.error(f"创建Pinecone索引失败: {e}")
+            return False
+    
+    def insert_vectors(self, knowledge_id: str, file_id: str, chunks: List[ChunkLike], embeddings: List[List[float]]):
+        """插入向量到Pinecone"""
+        if not self.pc:
+            return False
+            
+        try:
+            index_name = self.get_index_name(knowledge_id)
+            index = self.pc.Index(index_name)
+            
+            # 准备数据
+            vectors = []
+            for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+                vectors.append({
+                    "id": f"{file_id}_{i}",
+                    "values": embedding,
+                    "metadata": {
+                        "text": _chunk_text(chunk)[:1000],  # Pinecone元数据限制
+                        "file_id": file_id,
+                        "chunk_index": i,
+                        "knowledge_id": knowledge_id
+                    }
+                })
+            
+            # 分批插入（Pinecone限制每次100条）
+            batch_size = 100
+            for i in range(0, len(vectors), batch_size):
+                batch = vectors[i:i + batch_size]
+                index.upsert(vectors=batch)
+            
+            logger.info(f"成功插入{len(vectors)}个向量到Pinecone")
+            return True
+        except Exception as e:
+            logger.error(f"插入向量到Pinecone失败: {e}")
+            return False
+    
+    def search(self, knowledge_id: str, query_embedding: List[float], top_k: int = 5):
+        """在Pinecone中搜索相似向量"""
+        if not self.pc:
+            return []
+            
+        try:
+            index_name = self.get_index_name(knowledge_id)
+            index = self.pc.Index(index_name)
+            
+            results = index.query(
+                vector=query_embedding,
+                top_k=top_k,
+                include_metadata=True
+            )
+            
+            return [
+                {
+                    "text": match['metadata'].get('text', ''),
+                    "score": match['score'],
+                    "file_id": match['metadata'].get('file_id', ''),
+                    "chunk_index": match['metadata'].get('chunk_index', 0)
+                }
+                for match in results.get('matches', [])
+            ]
+        except Exception as e:
+            logger.error(f"Pinecone搜索失败: {e}")
+            return []
+
+
+async def get_embeddings_openai(texts: List[str], model: str = "text-embedding-3-small") -> List[List[float]]:
+    """
+    使用OpenAI Embeddings API获取文本向量（替代本地sentence-transformers）
+    
+    Args:
+        texts: 文本列表
+        model: 嵌入模型名称
+        
+    Returns:
+        向量列表
+    """
+    # 获取API密钥
+    api_keys = get_api_keys()
+    openai_key = api_keys.get('openai', '')
+    
+    if not openai_key:
+        logger.error("未配置OPENAI_API_KEY")
+        return []
+    
+    try:
+        import httpx
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                "https://api.openai.com/v1/embeddings",
+                headers={
+                    "Authorization": f"Bearer {openai_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": model,
+                    "input": texts
+                }
+            )
+            
+            if response.status_code != 200:
+                logger.error(f"OpenAI API错误: {response.status_code} - {response.text}")
+                return []
+            
+            result = response.json()
+            embeddings = [item["embedding"] for item in result["data"]]
+            logger.info(f"成功获取{len(embeddings)}个向量，维度: {len(embeddings[0])}")
+            return embeddings
+            
+    except Exception as e:
+        logger.error(f"OpenAI嵌入API调用失败: {e}")
+        return []
 
 
 class EmbeddingManager:
@@ -437,7 +655,7 @@ class EmbeddingManager:
         chunk_size: int = 1000,
         chunk_overlap: int = 200,
         separator: Optional[str] = None
-    ) -> Tuple[List[Dict[str, Any]], List[List[float]]]:
+    ) -> Tuple[List[KnowledgeChunk], List[List[float]]]:
         """
         处理文本并生成嵌入向量
         
@@ -452,7 +670,7 @@ class EmbeddingManager:
             separator (Optional[str]): 分隔符
             
         返回:
-            Tuple[List[Dict[str, Any]], List[List[float]]]: 分段和嵌入向量
+            Tuple[List[KnowledgeChunk], List[List[float]]]: 分段和嵌入向量
         """
         try:
             # 获取嵌入模型
@@ -476,7 +694,7 @@ class EmbeddingManager:
                 return [], []
                 
             # 提取文本内容用于生成嵌入向量
-            texts = [chunk["text"] for chunk in chunks]
+            texts = [chunk.text for chunk in chunks]
             
             # 生成嵌入向量
             embeddings = await EmbeddingManager.generate_embeddings(model, texts)
@@ -491,7 +709,7 @@ class EmbeddingManager:
     async def save_embeddings(
         output_dir: str,
         file_id: str,
-        chunks: List[Dict[str, Any]],
+        chunks: List[ChunkLike],
         embeddings: List[List[float]]
     ) -> Optional[str]:
         """
@@ -500,7 +718,7 @@ class EmbeddingManager:
         参数:
             output_dir (str): 输出目录
             file_id (str): 文件ID
-            chunks (List[Dict[str, Any]]): 分段列表
+            chunks (List[ChunkLike]): 分段列表
             embeddings (List[List[float]]): 嵌入向量列表
             
         返回:
@@ -522,8 +740,8 @@ class EmbeddingManager:
             for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
                 save_data.append({
                     "index": i,
-                    "text": chunk["text"],
-                    "metadata": chunk["metadata"],
+                    "text": _chunk_text(chunk),
+                    "metadata": _chunk_metadata(chunk),
                     "embedding": embedding
                 })
                 
@@ -532,7 +750,7 @@ class EmbeddingManager:
                 json.dump(save_data, f, ensure_ascii=False, indent=2)
             
             # 保存到向量数据库
-            knowledge_id = chunks[0]["metadata"].get("knowledge_id", "")
+            knowledge_id = _chunk_metadata(chunks[0]).get("knowledge_id", "")
             if knowledge_id:
                 vector_store = EmbeddingManager.get_vector_store()
                 vector_store.insert_vectors(knowledge_id, file_id, chunks, embeddings)

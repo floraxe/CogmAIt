@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from dotenv import load_dotenv
+load_dotenv()  # 自动加载项目根目录的 .env 文件
 import os
 import sys
 import json
@@ -12,22 +14,35 @@ from concurrent.futures import ThreadPoolExecutor
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# 读取配置文件
-config_file = os.environ.get("CONFIG_FILE", "config.json")
-if not os.path.exists(config_file):
-    config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+def resolve_config_path(config_file_env, base_dir):
+    """解析配置文件路径：优先环境变量，不存在则回落到项目默认路径。"""
+    if config_file_env and os.path.exists(config_file_env):
+        return config_file_env
+    return os.path.join(base_dir, "config.json")
 
-try:
-    with open(config_file, "r", encoding="utf-8") as f:
-        config = json.load(f)
-except Exception as e:
-    logger.error(f"无法读取配置文件: {str(e)}")
-    config = {}
 
-# 获取配置
-host = config.get("host", "0.0.0.0")
-port = config.get("port", 8000)
-reload = config.get("reload", True)
+def load_server_config(config_file):
+    """读取配置文件，失败时返回空字典（保持原行为）。"""
+    try:
+        with open(config_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error(f"无法读取配置文件: {str(e)}")
+        return {}
+
+
+def get_uvicorn_options(config):
+    """从配置中提取 uvicorn 运行参数（含默认值）。"""
+    host = config.get("host", "0.0.0.0")
+    port = config.get("port", 8000)
+    reload = config.get("reload", True)
+    return host, port, reload
+
+
+_base_dir = os.path.dirname(os.path.abspath(__file__))
+_config_file = resolve_config_path(os.environ.get("CONFIG_FILE"), _base_dir)
+_config = load_server_config(_config_file)
+host, port, reload = get_uvicorn_options(_config)
 
 # 启动MCP服务
 async def start_mcp_service():

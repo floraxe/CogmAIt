@@ -1,188 +1,181 @@
-# CogmAIt 后端 API
+# CogmAIt Backend
 
-这是CogmAIt项目的后端API，使用FastAPI框架开发，提供模型管理、知识管理和智能体管理等功能。本项目采用了可插拔式的模型提供商设计，支持灵活扩展不同的AI模型服务。
+CogmAIt 是一个基于 FastAPI 的智能体后端服务，包含模型接入、知识库检索、图谱检索、MCP 工具编排与流式对话能力。
 
-## 特性
+本 README 作为项目唯一说明文档，目标是让新接手同学快速完成环境准备、启动运行与问题排查。
 
-- **可插拔式模型提供商**：每个新的AI模型提供商只需添加一个Python模块，系统会自动加载并集成
-- **支持多种模型类型**：聊天、文本补全、嵌入向量等
-- **RESTful API**：符合RESTful设计规范的API接口
-- **自动文档生成**：基于FastAPI自动生成的API文档
-- **异步处理**：使用异步编程提高性能
-- **类型安全**：使用Pydantic进行数据验证和类型检查
+## 1. 技术栈与能力
 
-## 安装
+- Python 3.11+
+- FastAPI + Uvicorn
+- SQLAlchemy + MySQL
+- MinIO 对象存储
+- Neo4j 图数据库（可选）
+- 多模型 Provider 机制（OpenAI、Anthropic、Google、本地模型等）
+- 流水线式对话编排：Audit -> Strategies -> Inference -> Filter
 
-1. 克隆仓库
+## 2. 目录总览
+
+```text
+source_code_agent/
+├── app/
+│   ├── api/                    # 路由层
+│   ├── services/               # 业务编排与服务层
+│   ├── providers/              # 模型提供商
+│   ├── domain/                 # 领域对象与抽象数据类型
+│   ├── db/                     # 数据访问与初始化
+│   └── main.py                 # FastAPI 入口
+├── scripts/
+│   ├── bootstrap.ps1           # 首次初始化（依赖 + 基础设施）
+│   ├── start-dev.ps1           # 日常开发启动
+│   └── stop-dev.ps1            # 停止基础设施
+├── tests/                      # 自动化测试
+├── docker-compose.yml          # MySQL + MinIO
+├── pyproject.toml              # Poetry 依赖与项目配置
+├── run.py                      # 启动脚本（含 MCP 子进程）
+└── README.md
+```
+
+## 3. 环境要求
+
+请先安装以下工具。
+
+- Docker Desktop（需可执行 `docker compose`）
+- Python 3.11 或更高版本
+- Poetry（建议最新版）
+
+可选组件。
+
+- Neo4j（如果需要图谱检索能力）
+- 外部模型 API Key（OpenAI/Anthropic/Google 等）
+
+## 4. 快速启动（Windows 推荐）
+
+### 4.1 首次启动
+
+在项目根目录执行。
+
+```powershell
+cd E:\source\source_code_agent
+.\scripts\bootstrap.ps1
+```
+
+该脚本会执行以下动作。
+
+- 启动 MySQL 容器
+- 复用已有 `minio-server` 容器，避免容器名冲突
+- 若无 MinIO 容器则自动创建
+- 执行 `poetry install --no-root` 安装依赖
+
+### 4.2 日常开发启动
+
+```powershell
+cd E:\source\source_code_agent
+.\scripts\start-dev.ps1
+```
+
+该脚本会启动基础设施并运行后端服务。
+
+### 4.3 停止服务
+
+```powershell
+cd E:\source\source_code_agent
+.\scripts\stop-dev.ps1
+```
+
+## 5. 手动启动（跨平台）
+
+如不使用 PowerShell 脚本，可手动执行。
 
 ```bash
-git clone <repository-url>
-cd cogmait-backend
+docker compose up -d mysql minio
+poetry install --no-root
+poetry run python run.py
 ```
 
-2. 创建虚拟环境（推荐）
+默认访问地址。
+
+- API: `http://127.0.0.1:8000`
+- Swagger: `http://127.0.0.1:8000/docs`
+- ReDoc: `http://127.0.0.1:8000/redoc`
+- MinIO API: `http://127.0.0.1:9000`
+- MinIO Console: `http://127.0.0.1:9001`
+
+## 6. 配置说明
+
+### 6.1 `.env`
+
+复制 `.env.example` 为 `.env` 并按实际环境修改。
 
 ```bash
-python -m venv venv
-source venv/bin/activate  # Linux/Mac
-venv\Scripts\activate  # Windows
+cp .env.example .env
 ```
 
-3. 安装依赖
+常见配置包括数据库连接、鉴权密钥、跨域、模型 Key 等。
+
+### 6.2 `config.json`
+
+`run.py` 默认读取项目根目录 `config.json`，可通过环境变量 `CONFIG_FILE` 指向其他路径。
 
 ```bash
-pip install -r requirements.txt
+# Windows PowerShell 示例
+$env:CONFIG_FILE = "E:\source\source_code_agent\config.json"
+poetry run python run.py
 ```
 
-## 配置
+## 7. 对话架构（重构后）
 
-1. 创建 `.env` 文件（可选）
+当前对话主链路采用分阶段流水线，API 入口只负责调度。
 
-```
-# API设置
-API_V1_STR=/api
-PROJECT_NAME=CogmAIt
+1. **Audit**：请求合法性与访问上下文检查。
+2. **Strategies**：按智能体配置执行增强策略。
+   - WebSearchStrategy
+   - KnowledgeRetrievalStrategy
+   - GraphRetrievalStrategy
+3. **Inference**：调用模型流式推理并输出标准事件。
+4. **Filter**：结果收尾与历史记录持久化。
 
-# 安全设置
-SECRET_KEY=your-secret-key
+对应核心文件。
 
-# CORS设置
-CORS_ORIGINS=http://localhost:3000,http://localhost:5173
+- `app/api/v1/endpoints/agents.py`
+- `app/services/chat_orchestration_service.py`
+- `app/services/strategy_base.py`
 
-# 数据库设置
-DATABASE_URI=sqlite:///./cogmait.db
-
-# 模型API密钥（可选）
-OPENAI_API_KEY=your-openai-api-key
-ANTHROPIC_API_KEY=your-anthropic-api-key
-```
-
-## 运行
+## 8. 测试与质量检查
 
 ```bash
-python run.py
+poetry run pytest
+poetry run pytest tests/services -q
+poetry run radon cc app/api/v1/endpoints/agents.py -s
 ```
 
-服务将在 http://localhost:8000 启动，API文档可在 http://localhost:8000/docs 访问。
+说明。
 
-## 目录结构
+- 推荐优先跑 `tests/services` 验证策略与流水线关键行为。
+- 外部依赖不完整时可通过 mock/stub 保持核心测试可运行。
 
-```
-cogmait-backend/
-├── app/                  # 应用程序目录
-│   ├── api/              # API相关代码
-│   │   └── v1/           # v1版本API
-│   │       ├── api.py    # API路由聚合
-│   │       └── endpoints/# API端点
-│   ├── core/             # 核心配置
-│   ├── db/               # 数据库相关
-│   ├── models/           # 数据库模型
-│   ├── providers/        # 模型提供商实现
-│   │   ├── base.py       # 提供商基类
-│   │   ├── manager.py    # 提供商管理器
-│   │   ├── openai_provider.py # OpenAI实现
-│   │   └── ...           # 其他提供商实现
-│   ├── schemas/          # Pydantic模型
-│   ├── utils/            # 工具函数
-│   └── main.py           # 应用程序入口
-├── requirements.txt      # 依赖项
-├── run.py                # 运行脚本
-└── README.md             # 项目说明
-```
+## 9. 常见问题
 
-## 添加新的模型提供商
+### 9.1 MinIO 容器名冲突
 
-要添加新的模型提供商，只需在 `app/providers/` 目录中创建一个新的Python模块，并实现 `ModelProvider` 抽象基类：
+现象：`/minio-server is already in use`。  
+处理：已在脚本内自动复用同名容器，通常无需手工处理。
 
-1. 创建文件，例如 `app/providers/new_provider.py`
-2. 实现 `ModelProvider` 基类的所有抽象方法
-3. 重启应用程序，系统将自动加载新的提供商
+### 9.2 Poetry 安装时报包路径错误
 
-示例：
+现象：`No file/folder found for package ...`。  
+处理：使用 `poetry install --no-root`，项目脚本已内置该行为。
 
-```python
-from app.providers.base import ModelProvider
+### 9.3 可选依赖缺失告警
 
-class NewProvider(ModelProvider):
-    @property
-    def provider_id(self) -> str:
-        return "new_provider"
-    
-    @property
-    def provider_name(self) -> str:
-        return "新提供商"
-    
-    # 实现其他必要方法...
-```
+部分功能（如向量检索、本地模型）依赖可选组件。未安装时相关能力会降级，不影响基础 API 启动。
 
-## API文档
+## 10. 开发建议
 
-启动服务后，可以通过以下URL访问API文档：
+- 新增增强能力时，优先通过策略接口接入，不要把分支逻辑堆回 API 入口。
+- 变更对话主流程后，至少补充一条服务层自动化测试。
+- 优先保持 `agents.py` 入口轻量，复杂逻辑下沉到 `services` 层。
 
-- Swagger UI: http://localhost:8000/docs
-- ReDoc: http://localhost:8000/redoc
+## 11. 许可证
 
-## 许可
-
-[MIT License](LICENSE)
-
-# 知识图谱管理系统 - 后端
-
-## Neo4j配置
-
-1. 安装Neo4j数据库：从 [Neo4j官网](https://neo4j.com/download/) 下载并安装Neo4j Desktop或使用Docker
-
-   ```bash
-   # Docker安装示例
-   docker run \
-     --name neo4j \
-     -p 7474:7474 -p 7687:7687 \
-     -e NEO4J_AUTH=neo4j/password \
-     -e NEO4J_PLUGINS=\[\"apoc\"\] \
-     neo4j:5.15
-   ```
-
-2. 配置Neo4j连接信息：将`config.json.example`复制为`config.json`，并填写Neo4j连接信息
-
-   ```bash
-   cp config.json.example config.json
-   # 然后编辑config.json文件
-   ```
-
-3. 安装Neo4j-GraphRAG所需的插件
-
-   - APOC插件：提供高级功能
-   - Vector插件：提供向量搜索功能
-
-## 启动服务
-
-```bash
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-```
-
-## Neo4j-GraphRAG集成
-
-本系统使用Neo4j-GraphRAG来构建和查询知识图谱。主要功能包括：
-
-1. 自动创建Neo4j子图：每个知识图谱对应一个Neo4j子图
-2. 文本抽取和知识图谱构建：上传文件后，系统会解析文本并使用GraphRAG构建知识图谱
-3. 图谱可视化：支持在前端展示Neo4j知识图谱
-
-### 工作流程
-
-1. 创建知识图谱：会自动创建Neo4j子图
-2. 上传文件：系统解析文件内容
-3. 知识提取：使用GraphRAG提取文本中的实体和关系
-4. 可视化：在前端展示构建的知识图谱
-
-### 环境变量配置（可选）
-
-除了config.json，也可以使用环境变量配置Neo4j和OpenAI：
-
-```
-NEO4J_URI=bolt://localhost:7687
-NEO4J_USERNAME=neo4j
-NEO4J_PASSWORD=password
-NEO4J_DATABASE=neo4j
-OPENAI_API_KEY=your_openai_key
-``` 
+MIT License。

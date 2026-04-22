@@ -25,3 +25,5 @@ __pycache__/
 uploads/
 volumes/
 data/
+minio-data/
+../minio-data/
