@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import AliasChoices, BaseModel, Field, ConfigDict
 from typing import Optional, List, Dict, Any, Union
 
 
@@ -105,6 +105,22 @@ class AgentChatRequest(BaseModel):
     config: Optional[Dict[str, Any]] = None
     type: Optional[str] = None
     file_ids: Optional[List[str]] = Field(default=None, alias="fileIds")  # 添加文件ID列表字段
+
+
+class ShareChatRequestBody(BaseModel):
+    """分享页单轮对话请求体（兼容 snake_case 与前端 camelCase）。"""
+
+    message: str = ""
+    session_id: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("session_id", "sessionId"),
+    )
+    file_ids: List[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("file_ids", "fileIds"),
+    )
+
+    model_config = ConfigDict(extra="ignore")
 
 
 class AgentChatResponse(BaseModel):

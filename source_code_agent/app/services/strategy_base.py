@@ -24,5 +24,10 @@ class StrategyResult:
 
 class BaseRetrievalStrategy(ABC):
     @abstractmethod
+    def is_active(self, agent: Any) -> bool:
+        """根据智能体配置决定该策略是否应当激活，满足开闭原则：新增策略只需实现此方法。"""
+        raise NotImplementedError
+
+    @abstractmethod
     async def execute(self, context: StrategyContext) -> StrategyResult:
         raise NotImplementedError

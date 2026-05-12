@@ -46,9 +46,9 @@ class Settings(BaseSettings):
     DB_HOST: str = "localhost"
     DB_PORT: str = "3306"
     DB_USER: str = "root"
-    DB_PASSWORD: str = "qxy113872005"
+    DB_PASSWORD: str = ""
     DB_NAME: str = "cogmait"
-    DB_DATABASE: str = "cogmait"  # ✅ 补全：声明 DB_DATABASE 字段，匹配环境变量
+    DB_DATABASE: str = "cogmait"
     DATABASE_URI: Optional[str] = None
 
     @property

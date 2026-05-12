@@ -27,9 +27,10 @@ def mock_all_dependencies():
             mock_session_local = MagicMock(return_value=mock_db_session)
             with patch("app.db.session.SessionLocal", mock_session_local):
                 
-                # 4. 【核心修正】Mock get_cn_datetime：修正位置、返回真实datetime对象
-                # 业务代码在app.utils.security中使用，因此patch该位置
-                mock_cn_time = datetime(2026, 4, 3, 16, 30, 0, tzinfo=timezone(timedelta(hours=8)))
+                # 4. Mock get_cn_datetime：须接近「当前真实时间」。
+                # JWT 的 exp 由该时间与 ACCESS_TOKEN_EXPIRE_MINUTES 推算；若固定为过去日期，
+                # jwt.decode 会用系统时钟校验导致 ExpiredSignatureError，令牌相关测试全部失效。
+                mock_cn_time = datetime.now(timezone.utc)
                 with patch("app.utils.security.get_cn_datetime", return_value=mock_cn_time):
                     
                     # 所有依赖 Mock 完成，向测试用例暴露 Mock 对象和返回值

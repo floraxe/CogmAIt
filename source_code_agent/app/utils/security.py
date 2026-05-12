@@ -100,7 +100,6 @@ async def get_current_user(
     try:
         # 解码JWT令牌
         payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
-        print("用户：：", payload)
         username: str = payload.get("sub")
 
         if username is None:

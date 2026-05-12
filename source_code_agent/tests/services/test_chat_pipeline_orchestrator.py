@@ -1,14 +1,17 @@
+"""
+流水线编排器集成测试。
+
+使用 fake 对象替换所有外部依赖（DB、模型、MCP 等），
+验证四阶段 Pipeline 的事件序列与历史持久化行为。
+"""
 import asyncio
 import json
 from types import SimpleNamespace
 
-from app.services.chat_orchestration_service import (
-    ChatPipelineOrchestrator,
-    ChatPipelineRequest,
-    DocumentContextResult,
-    McpOrchestrationResult,
-    StrategyResult,
-)
+from app.services.chat_pipeline import ChatPipelineOrchestrator, ChatPipelineRequest
+from app.services.document_context_service import DocumentContextResult
+from app.services.mcp_service import McpOrchestrationResult
+from app.services.strategy_base import StrategyResult
 from app.schemas.agent import AgentChatMessage
 
 
@@ -27,9 +30,12 @@ class _FakeDocumentService:
 
 
 class _FakeRetrievalStrategy:
+    def is_active(self, agent):
+        return True
+
     async def execute(self, context):
         return StrategyResult(
-            events=[{"event": "web_search_complete", "data": {"ok": True}}],
+            events=[{"event": "web_search_complete", "data": json.dumps({"ok": True})}],
             sources=[{"type": "web_search", "source_file": "demo"}],
             web_search_results=[{"title": "demo"}],
         )
@@ -38,7 +44,7 @@ class _FakeRetrievalStrategy:
 class _FakeMcpService:
     async def run(self, db, agent, user_message, model_id, current_user_id):
         return McpOrchestrationResult(
-            events=[{"event": "mcp_result", "data": {"ok": True}, "sleep": 0}],
+            events=[{"event": "mcp_result", "data": json.dumps({"ok": True})}],
             tool_result_prompt="tool result",
         )
 
@@ -86,13 +92,30 @@ def _build_request():
     )
 
 
-def test_chat_pipeline_stream_contains_four_stage_key_events(monkeypatch):
-    orchestrator = ChatPipelineOrchestrator()
-    orchestrator.document_service = _FakeDocumentService()
-    orchestrator.mcp_service = _FakeMcpService()
-    orchestrator.response_service = _FakeResponseService()
-    orchestrator.inference_service = _FakeInferenceService()
+def _build_orchestrator(fake_agent, monkeypatch, *, capture: dict = None):
+    """
+    工厂函数：通过构造函数注入所有 fake 服务，展示 DI 的正确用法。
+    monkeypatch 只用于替换 chat_pipeline 内 agent_utils 别名指向模块上的 DB/history 调用，
+    不再通过属性赋值覆盖已构造好的对象。
+    """
+    monkeypatch.setattr("app.services.chat_pipeline.agent_utils.get_agent", lambda db, aid: fake_agent)
+    monkeypatch.setattr("app.services.chat_pipeline.agent_utils.get_model", lambda db, mid: {"id": mid})
+    if capture is not None:
+        monkeypatch.setattr(
+            "app.services.chat_pipeline.agent_utils.create_chat_history",
+            lambda **kw: capture.update(kw),
+        )
 
+    return ChatPipelineOrchestrator(
+        document_service=_FakeDocumentService(),
+        mcp_service=_FakeMcpService(),
+        response_service=_FakeResponseService(),
+        inference_service=_FakeInferenceService(),
+        strategy_registry=[_FakeRetrievalStrategy()],
+    )
+
+
+def test_chat_pipeline_stream_contains_four_stage_key_events(monkeypatch):
     fake_agent = SimpleNamespace(
         model_id="model-1",
         config={"top_p": 0.9},
@@ -101,9 +124,7 @@ def test_chat_pipeline_stream_contains_four_stage_key_events(monkeypatch):
         knowledge_bases=[],
         graphs=[],
     )
-    monkeypatch.setattr("app.services.chat_orchestration_service.agent_utils.get_agent", lambda db, agent_id: fake_agent)
-    monkeypatch.setattr("app.services.chat_orchestration_service.agent_utils.get_model", lambda db, model_id: {"id": model_id})
-    monkeypatch.setattr("app.services.chat_orchestration_service.WebSearchStrategy", lambda svc: _FakeRetrievalStrategy())
+    orchestrator = _build_orchestrator(fake_agent, monkeypatch)
 
     events = asyncio.run(_collect_events(orchestrator.stream(_build_request())))
     event_names = [item["event"] for item in events]
@@ -118,12 +139,6 @@ def test_chat_pipeline_stream_contains_four_stage_key_events(monkeypatch):
 
 
 def test_chat_pipeline_filter_persists_chat_history(monkeypatch):
-    orchestrator = ChatPipelineOrchestrator()
-    orchestrator.document_service = _FakeDocumentService()
-    orchestrator.mcp_service = _FakeMcpService()
-    orchestrator.response_service = _FakeResponseService()
-    orchestrator.inference_service = _FakeInferenceService()
-
     fake_agent = SimpleNamespace(
         model_id="model-2",
         config={},
@@ -132,16 +147,8 @@ def test_chat_pipeline_filter_persists_chat_history(monkeypatch):
         knowledge_bases=[],
         graphs=[],
     )
-    monkeypatch.setattr("app.services.chat_orchestration_service.agent_utils.get_agent", lambda db, agent_id: fake_agent)
-    monkeypatch.setattr("app.services.chat_orchestration_service.agent_utils.get_model", lambda db, model_id: {"id": model_id})
-    monkeypatch.setattr("app.services.chat_orchestration_service.WebSearchStrategy", lambda svc: _FakeRetrievalStrategy())
-
-    captured = {}
-
-    def _capture_history(**kwargs):
-        captured.update(kwargs)
-
-    monkeypatch.setattr("app.services.chat_orchestration_service.agent_utils.create_chat_history", _capture_history)
+    captured: dict = {}
+    orchestrator = _build_orchestrator(fake_agent, monkeypatch, capture=captured)
 
     asyncio.run(_collect_events(orchestrator.stream(_build_request())))
 
