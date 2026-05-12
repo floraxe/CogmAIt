@@ -1,0 +1,6 @@
+# 仓库根目录（与 source_code_agent/.gitignore 互补）
+minio-data/
+__MACOSX/
+.DS_Store
+.env
+*.local
