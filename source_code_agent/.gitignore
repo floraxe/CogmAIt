@@ -1,29 +1,59 @@
-# Logs
-logs
+# ─── 敏感配置（只提交 *.example，不提交含真实凭据的文件）──────────────────
+.env
+config.json
+
+# ─── Python ────────────────────────────────────────────────────────────────
+*.py[cod]
+*.pyo
+*.pyd
+__pycache__/
+*.so
+
+# ─── 虚拟环境 ───────────────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ─── 测试 & 覆盖率 ───────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+nosetests.xml
+*.cover
+
+# ─── 打包 & 分发 ─────────────────────────────────────────────────────────────
+dist/
+build/
+*.egg-info/
+*.egg
+
+# ─── 日志 ───────────────────────────────────────────────────────────────────
+logs/
 *.log
 npm-debug.log*
 yarn-debug.log*
-yarn-error.log*
 pnpm-debug.log*
-lerna-debug.log*
 
-node_modules
-*.local
-
-# Editor directories and files
+# ─── 编辑器 & 系统 ────────────────────────────────────────────────────────────
 .vscode/*
 !.vscode/extensions.json
-.idea
+.idea/
 .DS_Store
 *.suo
 *.ntvs*
 *.njsproj
 *.sln
 *.sw?
+Thumbs.db
 
-__pycache__/
+# ─── 项目本地数据 ─────────────────────────────────────────────────────────────
 uploads/
 volumes/
 data/
 minio-data/
 ../minio-data/
+node_modules/
+*.local

@@ -2,7 +2,6 @@
 
 CogmAIt 是一个基于 FastAPI 的智能体后端服务，包含模型接入、知识库检索、图谱检索、MCP 工具编排与流式对话能力。
 
-本 README 作为项目唯一说明文档，目标是让新接手同学快速完成环境准备、启动运行与问题排查。
 
 ## 1. 技术栈与能力
 
@@ -101,45 +100,81 @@ poetry run python run.py
 - MinIO API: `http://127.0.0.1:9000`
 - MinIO Console: `http://127.0.0.1:9001`
 
+智能体类型枚举请统一使用 `GET /api/agents/types`（需登录）；流式对话接口在 OpenAPI 中声明为 `text/event-stream`，不再误标为 JSON 的 `AgentChatResponse`。
+
 ## 6. 配置说明
 
-### 6.1 `.env`
+> **安全规则**：仓库只追踪 `*.example` 模板文件。`.env` 和 `config.json` 已被 `.gitignore` 排除，不要手动 `git add` 它们。
 
-复制 `.env.example` 为 `.env` 并按实际环境修改。
+### 6.1 `.env`（必须）
 
 ```bash
 cp .env.example .env
 ```
 
-常见配置包括数据库连接、鉴权密钥、跨域、模型 Key 等。
+然后编辑 `.env`，填入以下关键值（其余可选项保留注释即可）：
 
-### 6.2 `config.json`
+| 变量 | 说明 |
+|---|---|
+| `SECRET_KEY` | JWT 签名密钥，建议用 `python -c "import secrets; print(secrets.token_urlsafe(32))"` 生成 |
+| `DB_PASSWORD` | MySQL root 密码，与 `docker-compose.yml` 中 `DB_PASSWORD` 保持一致 |
+| `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` | MinIO 凭据，默认 `minioadmin` |
+| `OPENAI_API_KEY` 等 | 至少配置一个模型提供商的 Key |
+| `TAVILY_API_KEY` | 如需联网搜索则配置 |
 
-`run.py` 默认读取项目根目录 `config.json`，可通过环境变量 `CONFIG_FILE` 指向其他路径。
+### 6.2 `config.json`（Neo4j，可选）
 
 ```bash
-# Windows PowerShell 示例
-$env:CONFIG_FILE = "E:\source\source_code_agent\config.json"
-poetry run python run.py
+cp config.json.example config.json
 ```
 
-## 7. 对话架构（重构后）
+编辑 `config.json`，填入 Neo4j 连接信息。不使用图谱检索时可跳过此步骤。
+
+也可以用环境变量替代 `config.json`（优先级更高）：
+
+```bash
+# 在 .env 中取消注释并填写
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USERNAME=neo4j
+NEO4J_PASSWORD=your-neo4j-password
+NEO4J_DATABASE=neo4j
+```
+
+## 7. 对话架构
 
 当前对话主链路采用分阶段流水线，API 入口只负责调度。
 
-1. **Audit**：请求合法性与访问上下文检查。
-2. **Strategies**：按智能体配置执行增强策略。
-   - WebSearchStrategy
-   - KnowledgeRetrievalStrategy
-   - GraphRetrievalStrategy
-3. **Inference**：调用模型流式推理并输出标准事件。
-4. **Filter**：结果收尾与历史记录持久化。
+1. **Audit**：请求合法性与访问上下文检查（`chat_pipeline._audit`）。
+2. **Strategies**：策略注册表按 `is_active(agent)` 动态激活，符合开闭原则。
+   - `strategies/web_search.py` — WebSearchStrategy（自包含逻辑）
+   - `strategies/knowledge_retrieval.py` — KnowledgeRetrievalStrategy（自包含逻辑）
+   - `strategies/graph.py` — GraphRetrievalStrategy（委托 GraphRetrievalService）
+3. **Inference**：MCP 工具编排 + 模型流式推理（`mcp_service` + `model_inference_service`）。
+4. **Filter**：结果收尾与聊天历史持久化（`chat_pipeline._run_filter`）。
 
-对应核心文件。
+**核心服务文件（每个职责独立）：**
 
-- `app/api/v1/endpoints/agents.py`
-- `app/services/chat_orchestration_service.py`
-- `app/services/strategy_base.py`
+```text
+app/services/
+├── chat_pipeline.py            # 四阶段编排器（主入口）
+├── strategy_base.py            # BaseRetrievalStrategy + StrategyContext/Result
+├── strategies/
+│   ├── web_search.py           # 联网搜索策略
+│   ├── knowledge_retrieval.py  # 知识库检索策略
+│   └── graph.py                # 图谱检索策略
+├── chat_events.py              # SSE 事件工厂（格式集中维护）
+├── agent_access_service.py     # 访问解析（从 API 层抽离）
+├── document_context_service.py
+├── model_inference_service.py
+├── mcp_service.py
+├── chat_response_service.py
+└── graph_retrieval_service.py
+```
+
+**新增策略只需：**
+1. 创建 `strategies/your_strategy.py`，实现 `is_active()` 和 `execute()`
+2. 在 `chat_pipeline.py` 的 `_strategy_registry` 列表里追加实例
+3. 不需要修改任何现有策略或编排逻辑
 
 ## 8. 测试与质量检查
 
@@ -175,7 +210,3 @@ poetry run radon cc app/api/v1/endpoints/agents.py -s
 - 新增增强能力时，优先通过策略接口接入，不要把分支逻辑堆回 API 入口。
 - 变更对话主流程后，至少补充一条服务层自动化测试。
 - 优先保持 `agents.py` 入口轻量，复杂逻辑下沉到 `services` 层。
-
-## 11. 许可证
-
-MIT License。

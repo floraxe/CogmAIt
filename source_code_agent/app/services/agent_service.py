@@ -1,272 +1,464 @@
-from typing import Dict, List, Any, Optional, AsyncGenerator
-from datetime import datetime
+"""
+智能体持久化与令牌、会话聚合等业务逻辑。
+
+路由层与编排层应调用本模块，避免在 app.utils 中堆叠业务实现。
+"""
+from __future__ import annotations
+
+import secrets
+import string
 import uuid
-import json
-import asyncio
+from datetime import datetime
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
-from ..models.agent import Agent, AgentType
-from ..models.model import Model
-from ..models.knowledge import Knowledge
-from ..models.graph import KnowledgeGraph
-from ..db import db
-from ..providers import model_provider_factory
-from ..services import knowledge_service, graph_service
+from sqlalchemy import and_, func
+from sqlalchemy.orm import Session
 
+from app.models.agent import Agent, AgentApiKey, AgentChatHistory, AgentShareToken
+from app.models.model import Model
+from app.schemas.agent import AgentCreate, AgentUpdate
 
-async def get_agents(user_id: str) -> List[Dict[str, Any]]:
-    """获取用户的所有智能体"""
-    agents = await db.agents.find({"user_id": user_id}).to_list(length=100)
-    return [agent.dict() for agent in agents]
+if TYPE_CHECKING:
+    from app.models.user import User
 
-
-async def get_agent_types() -> List[Dict[str, Any]]:
-    """获取所有支持的智能体类型"""
-    return [
-        {
-            "id": "text",
-            "name": "文本智能体",
-            "description": "基础的文本交互智能体",
-            "icon": "chat",
-            "requires": ["model_id"]
-        },
-        {
-            "id": "knowledge",
-            "name": "知识库智能体",
-            "description": "基于知识库的智能体",
-            "icon": "database",
-            "requires": ["model_id", "knowledge_id"]
-        },
-        {
-            "id": "graph",
-            "name": "知识图谱智能体",
-            "description": "基于知识图谱的智能体",
-            "icon": "share-alt",
-            "requires": ["model_id", "graph_id"]
-        },
-        {
-            "id": "hybrid",
-            "name": "混合智能体",
-            "description": "同时使用知识库和知识图谱的智能体",
-            "icon": "appstore",
-            "requires": ["model_id", "knowledge_id", "graph_id"]
-        }
-    ]
+def get_model(db: Session, model_id: str) -> Optional[Model]:
+    return db.query(Model).filter(Model.id == model_id).first()
 
 
-async def create_agent(
-    user_id: str,
-    name: str,
-    description: str,
-    agent_type: str,
-    model_id: Optional[str] = None,
-    knowledge_id: Optional[str] = None,
-    graph_id: Optional[str] = None,
-    system_prompt: Optional[str] = None,
-    config: Optional[Dict[str, Any]] = None
-) -> Dict[str, Any]:
-    """创建新的智能体"""
-    # 验证必要参数
-    if not name or not agent_type:
-        raise ValueError("智能体名称和类型不能为空")
-    
-    # 验证agent_type是否有效
-    valid_types = [t["id"] for t in await get_agent_types()]
-    if agent_type not in valid_types:
-        raise ValueError(f"不支持的智能体类型: {agent_type}")
-    
-    # 根据智能体类型验证必要参数
-    if agent_type in ["text", "knowledge", "graph", "hybrid"] and not model_id:
-        raise ValueError("模型ID不能为空")
-    
-    if agent_type in ["knowledge", "hybrid"] and not knowledge_id:
-        raise ValueError("知识库ID不能为空")
-    
-    if agent_type in ["graph", "hybrid"] and not graph_id:
-        raise ValueError("知识图谱ID不能为空")
-    
-    # 验证模型是否存在
-    if model_id:
-        model = await db.models.find_one({"_id": model_id, "user_id": user_id})
-        if not model:
-            raise ValueError(f"找不到指定的模型: {model_id}")
-    
-    # 验证知识库是否存在
-    if knowledge_id:
-        knowledge = await db.knowledge.find_one({"_id": knowledge_id, "user_id": user_id})
-        if not knowledge:
-            raise ValueError(f"找不到指定的知识库: {knowledge_id}")
-    
-    # 验证知识图谱是否存在
-    if graph_id:
-        graph = await db.knowledge_graphs.find_one({"_id": graph_id, "user_id": user_id})
-        if not graph:
-            raise ValueError(f"找不到指定的知识图谱: {graph_id}")
-    
-    # 创建智能体
-    agent_id = str(uuid.uuid4().hex)
-    now = datetime.utcnow()
-    
-    agent = Agent(
-        id=agent_id,
-        user_id=user_id,
-        name=name,
-        description=description,
-        type=agent_type,
-        model_id=model_id,
-        knowledge_id=knowledge_id,
-        graph_id=graph_id,
-        system_prompt=system_prompt or "",
-        config=config or {},
-        created_at=now,
-        updated_at=now
-    )
-    
-    await db.agents.insert_one(agent.dict())
-    return agent.dict()
+def get_agent(db: Session, agent_id: str) -> Optional[Agent]:
+    return db.query(Agent).filter(Agent.id == agent_id).first()
 
 
-async def update_agent(
+def get_agents(
+    db: Session,
+    skip: int = 0,
+    limit: int = 100,
+    name: Optional[str] = None,
+    type: Optional[str] = None,
+    status: Optional[str] = None,
+) -> List[Agent]:
+    query = db.query(Agent)
+    if name:
+        query = query.filter(Agent.name.ilike(f"%{name}%"))
+    if type:
+        query = query.filter(Agent.type == type)
+    if status:
+        query = query.filter(Agent.status == status)
+    return query.order_by(Agent.created_at.desc()).offset(skip).limit(limit).all()
+
+
+def count_agents(
+    db: Session,
+    name: Optional[str] = None,
+    type: Optional[str] = None,
+    status: Optional[str] = None,
+) -> int:
+    query = db.query(Agent)
+    if name:
+        query = query.filter(Agent.name.ilike(f"%{name}%"))
+    if type:
+        query = query.filter(Agent.type == type)
+    if status:
+        query = query.filter(Agent.status == status)
+    return query.count()
+
+
+def create_agent(
+    db: Session,
+    agent_in: AgentCreate,
+    *,
+    owner: Optional["User"] = None,
+) -> Agent:
+    """创建智能体；归属信息仅来自 owner（user_id / creator / created_by 一致）。"""
+    uid = str(owner.id) if owner else None
+    uname = owner.username if owner else None
+    agent_attrs: Dict[str, Any] = {
+        "id": str(uuid.uuid4().hex),
+        "name": agent_in.name,
+        "type": agent_in.type,
+        "description": agent_in.description,
+        "system_prompt": agent_in.system_prompt,
+        "welcome_message": agent_in.welcome_message,
+        "config": agent_in.config,
+        "creator": uname,
+        "created_by": uid,
+        "user_id": uid,
+        "status": "active",
+    }
+    if agent_in.model_id is not None:
+        agent_attrs["model_id"] = agent_in.model_id
+
+    db_agent = Agent(**agent_attrs)
+    db.add(db_agent)
+    db.commit()
+    db.refresh(db_agent)
+
+    if agent_in.knowledge_ids:
+        from app.utils.knowledge import get_knowledge
+
+        for knowledge_id in agent_in.knowledge_ids:
+            kb = get_knowledge(db, knowledge_id)
+            if kb:
+                db_agent.knowledge_bases.append(kb)
+
+    if agent_in.graph_ids:
+        from app.utils.graph import get_graph
+
+        for graph_id in agent_in.graph_ids:
+            graph = get_graph(db, graph_id)
+            if graph:
+                db_agent.graphs.append(graph)
+
+    if agent_in.mcp_service_ids:
+        from app.utils.mcp import get_mcp_service
+
+        for service_id in agent_in.mcp_service_ids:
+            service = get_mcp_service(db, service_id)
+            if service:
+                db_agent.mcp_services.append(service)
+
+    if agent_in.knowledge_ids or agent_in.graph_ids or agent_in.mcp_service_ids:
+        db.add(db_agent)
+        db.commit()
+        db.refresh(db_agent)
+
+    return db_agent
+
+
+def update_agent(db: Session, agent: Agent, agent_in: AgentUpdate) -> Agent:
+    update_data = agent_in.dict(exclude_unset=True)
+    knowledge_ids = update_data.pop("knowledge_ids", None)
+    graph_ids = update_data.pop("graph_ids", None)
+    mcp_service_ids = update_data.pop("mcp_service_ids", None)
+
+    for field, value in update_data.items():
+        if hasattr(agent, field) and value is not None:
+            setattr(agent, field, value)
+
+    agent.updated_at = datetime.utcnow()
+    db.add(agent)
+    db.commit()
+    db.refresh(agent)
+
+    if knowledge_ids is not None:
+        from app.utils.knowledge import get_knowledge
+
+        agent.knowledge_bases = []
+        for knowledge_id in knowledge_ids:
+            kb = get_knowledge(db, knowledge_id)
+            if kb:
+                agent.knowledge_bases.append(kb)
+
+    if graph_ids is not None:
+        from app.utils.graph import get_graph
+
+        agent.graphs = []
+        for graph_id in graph_ids:
+            graph = get_graph(db, graph_id)
+            if graph:
+                agent.graphs.append(graph)
+
+    if mcp_service_ids is not None:
+        from app.utils.mcp import get_mcp_service
+
+        agent.mcp_services = []
+        for service_id in mcp_service_ids:
+            service = get_mcp_service(db, service_id)
+            if service:
+                agent.mcp_services.append(service)
+
+    if knowledge_ids is not None or graph_ids is not None or mcp_service_ids is not None:
+        db.add(agent)
+        db.commit()
+        db.refresh(agent)
+
+    return agent
+
+
+def delete_agent(db: Session, agent_id: str) -> None:
+    agent = get_agent(db, agent_id)
+    if agent:
+        db.delete(agent)
+        db.commit()
+
+
+def create_chat_history(
+    db: Session,
     agent_id: str,
-    user_id: str,
-    update_data: Dict[str, Any]
-) -> Dict[str, Any]:
-    """更新智能体信息"""
-    # 验证智能体是否存在
-    agent = await db.agents.find_one({"_id": agent_id, "user_id": user_id})
-    if not agent:
-        raise ValueError(f"找不到指定的智能体: {agent_id}")
-    
-    agent_dict = agent.dict()
-    
-    # 获取需要更新的字段
-    update_fields = {}
-    for key, value in update_data.items():
-        if key in agent_dict and key not in ["id", "user_id", "created_at"]:
-            update_fields[key] = value
-    
-    if not update_fields:
-        return agent_dict  # 没有需要更新的字段
-    
-    # 更新最后修改时间
-    update_fields["updated_at"] = datetime.utcnow()
-    
-    # 更新智能体
-    await db.agents.update_one(
-        {"_id": agent_id, "user_id": user_id},
-        {"$set": update_fields}
+    session_id: str,
+    user_message: str,
+    agent_response: str,
+    user_id: Optional[str] = None,
+    tokens_used: int = 0,
+    response_time: int = 0,
+    extra_data: Optional[Dict[str, Any]] = None,
+    access_type: str = "user",
+    api_key_id: Optional[str] = None,
+    share_token_id: Optional[str] = None,
+    type: Optional[str] = None,
+    model_id: Optional[str] = None,
+) -> AgentChatHistory:
+    db_history = AgentChatHistory(
+        id=str(uuid.uuid4().hex),
+        agent_id=agent_id,
+        session_id=session_id,
+        user_id=user_id,
+        user_message=user_message,
+        agent_response=agent_response,
+        tokens_used=tokens_used,
+        response_time=response_time,
+        extra_data=extra_data,
+        access_type=access_type,
+        api_key_id=api_key_id,
+        share_token_id=share_token_id,
+        type=type,
+        model_id=model_id,
     )
-    
-    # 返回更新后的智能体
-    updated_agent = await db.agents.find_one({"_id": agent_id, "user_id": user_id})
-    return updated_agent.dict()
+    db.add(db_history)
+    db.commit()
+    db.refresh(db_history)
+    return db_history
 
 
-async def delete_agent(agent_id: str, user_id: str) -> None:
-    """删除智能体"""
-    # 验证智能体是否存在
-    agent = await db.agents.find_one({"_id": agent_id, "user_id": user_id})
+def get_chat_history(
+    db: Session,
+    agent_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 100,
+) -> List[AgentChatHistory]:
+    query = db.query(AgentChatHistory)
+    if agent_id:
+        query = query.filter(AgentChatHistory.agent_id == agent_id)
+    if session_id:
+        query = query.filter(AgentChatHistory.session_id == session_id)
+    if user_id:
+        query = query.filter(AgentChatHistory.user_id == user_id)
+    return query.order_by(AgentChatHistory.created_at.desc()).offset(skip).limit(limit).all()
+
+
+def count_chat_history(
+    db: Session,
+    agent_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+) -> int:
+    query = db.query(AgentChatHistory)
+    if agent_id:
+        query = query.filter(AgentChatHistory.agent_id == agent_id)
+    if session_id:
+        query = query.filter(AgentChatHistory.session_id == session_id)
+    if user_id:
+        query = query.filter(AgentChatHistory.user_id == user_id)
+    return query.count()
+
+
+def get_chat_sessions(
+    db: Session,
+    agent_id: str,
+    *,
+    session_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 20,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """按会话聚合；返回 (当前页摘要列表, 符合条件的会话总数)。"""
+    filters = [AgentChatHistory.agent_id == agent_id]
+    if session_id:
+        filters.append(AgentChatHistory.session_id == session_id)
+    if user_id:
+        filters.append(AgentChatHistory.user_id == user_id)
+    combined = and_(*filters)
+
+    total = (
+        db.query(func.count(func.distinct(AgentChatHistory.session_id)))
+        .filter(combined)
+        .scalar()
+    ) or 0
+
+    rows = (
+        db.query(
+            AgentChatHistory.session_id,
+            func.max(AgentChatHistory.created_at).label("last_message"),
+            func.count(AgentChatHistory.id).label("message_count"),
+            func.min(AgentChatHistory.created_at).label("first_message"),
+            func.min(AgentChatHistory.user_message).label("first_user_message"),
+            func.min(AgentChatHistory.type).label("type"),
+        )
+        .filter(combined)
+        .group_by(AgentChatHistory.session_id)
+        .order_by(func.max(AgentChatHistory.created_at).desc())
+        .offset(skip)
+        .limit(limit)
+        .all()
+    )
+    items = [
+        {
+            "sessionId": row.session_id,
+            "lastMessage": row.last_message,
+            "messageCount": row.message_count,
+            "firstMessage": row.first_message,
+            "firstUserMessage": row.first_user_message,
+            "type": row.type,
+        }
+        for row in rows
+    ]
+    return items, int(total)
+
+
+async def execute_model_inference(
+    db: Session,
+    model_id: str,
+    payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    from app.utils.model import execute_model_inference as model_inference
+
+    return await model_inference(db, model_id, payload)
+
+
+def get_graph(db: Session, graph_id: str):
+    from app.utils.graph import get_graph as get_graph_util
+
+    return get_graph_util(db, graph_id)
+
+
+def generate_random_token(length: int = 48) -> str:
+    alphabet = string.ascii_letters + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+def generate_share_token(db: Session, agent_id: str, name: Optional[str] = None) -> Tuple[str, str]:
+    agent = get_agent(db, agent_id)
     if not agent:
-        raise ValueError(f"找不到指定的智能体: {agent_id}")
-    
-    # 删除智能体
-    await db.agents.delete_one({"_id": agent_id, "user_id": user_id})
+        raise ValueError("智能体不存在")
+
+    token = generate_random_token(32)
+    share_token = AgentShareToken(
+        id=str(uuid.uuid4().hex),
+        agent_id=agent_id,
+        token=token,
+        name=name or f"分享链接 {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+    )
+    db.add(share_token)
+    if not agent.share_enabled:
+        agent.share_enabled = True
+    db.commit()
+    db.refresh(share_token)
+    return share_token.id, token
 
 
-async def _prepare_agent_context(agent: Agent, user_id: str) -> str:
-    """准备智能体的上下文信息"""
-    context = ""
-    
-    # 如果使用知识库，获取知识库内容
-    if agent.knowledge_id:
-        knowledge_content = await knowledge_service.get_knowledge_content(
-            agent.knowledge_id, 
-            user_id
+def generate_api_key(db: Session, agent_id: str, name: Optional[str] = None) -> Tuple[str, str]:
+    agent = get_agent(db, agent_id)
+    if not agent:
+        raise ValueError("智能体不存在")
+
+    api_key = generate_random_token(48)
+    api_key_obj = AgentApiKey(
+        id=str(uuid.uuid4().hex),
+        agent_id=agent_id,
+        key=api_key,
+        name=name or f"API密钥 {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+    )
+    db.add(api_key_obj)
+    if not agent.api_enabled:
+        agent.api_enabled = True
+    db.commit()
+    db.refresh(api_key_obj)
+    return api_key_obj.id, api_key
+
+
+def delete_api_key(db: Session, agent_id: str, key_id: str) -> bool:
+    api_key = (
+        db.query(AgentApiKey)
+        .filter(AgentApiKey.id == key_id, AgentApiKey.agent_id == agent_id)
+        .first()
+    )
+    if not api_key:
+        return False
+    db.delete(api_key)
+    db.commit()
+    return True
+
+
+def delete_share_token(db: Session, agent_id: str, token_id: str) -> bool:
+    share_token = (
+        db.query(AgentShareToken)
+        .filter(AgentShareToken.id == token_id, AgentShareToken.agent_id == agent_id)
+        .first()
+    )
+    if not share_token:
+        return False
+    db.delete(share_token)
+    db.commit()
+    return True
+
+
+def toggle_share_status(db: Session, agent_id: str, enabled: bool) -> bool:
+    agent = get_agent(db, agent_id)
+    if not agent:
+        return False
+    agent.share_enabled = enabled
+    db.commit()
+    db.refresh(agent)
+    return True
+
+
+def toggle_api_status(db: Session, agent_id: str, enabled: bool) -> bool:
+    agent = get_agent(db, agent_id)
+    if not agent:
+        return False
+    agent.api_enabled = enabled
+    db.commit()
+    db.refresh(agent)
+    return True
+
+
+def get_agent_by_share_token(db: Session, token: str) -> Optional[Agent]:
+    share_token = (
+        db.query(AgentShareToken)
+        .join(Agent, AgentShareToken.agent_id == Agent.id)
+        .filter(AgentShareToken.token == token)
+        .first()
+    )
+    if share_token:
+        share_token.usage_count += 1
+        share_token.last_used_at = datetime.now()
+        db.commit()
+        return share_token.agent
+
+    return (
+        db.query(Agent)
+        .filter(
+            Agent.share_token == token,
+            Agent.share_enabled == True,
         )
-        if knowledge_content:
-            context += f"知识库内容:\n{knowledge_content}\n\n"
-    
-    # 如果使用知识图谱，获取图谱内容
-    if agent.graph_id:
-        graph_content = await graph_service.get_graph_content(
-            agent.graph_id, 
-            user_id
-        )
-        if graph_content:
-            context += f"知识图谱内容:\n{graph_content}\n\n"
-    
-    return context
+        .first()
+    )
 
 
-async def chat_with_agent(
-    agent_id: str, 
-    user_id: str, 
-    messages: List[Dict[str, str]],
-    stream: bool = False
-) -> Any:
-    """与智能体对话"""
-    # 获取智能体信息
-    agent_doc = await db.agents.find_one({"_id": agent_id, "user_id": user_id})
-    if not agent_doc:
-        raise ValueError(f"找不到指定的智能体: {agent_id}")
-    
-    agent = Agent(**agent_doc)
-    
-    # 获取模型信息
-    model_doc = await db.models.find_one({"_id": agent.model_id, "user_id": user_id})
-    if not model_doc:
-        raise ValueError(f"找不到智能体使用的模型: {agent.model_id}")
-    
-    model = Model(**model_doc)
-    
-    # 实例化模型提供者
-    provider = model_provider_factory.create_provider(model.provider)
-    
-    # 准备系统提示词
-    system_prompt = agent.system_prompt or "你是一个有帮助的AI助手。"
-    
-    # 根据智能体类型准备上下文
-    context = await _prepare_agent_context(agent, user_id)
-    if context:
-        system_prompt = f"{system_prompt}\n\n{context}"
-    
-    # 准备完整的消息列表
-    full_messages = [{"role": "system", "content": system_prompt}]
-    full_messages.extend(messages)
-    
-    # 调用模型API进行对话
-    try:
-        # 流式输出
-        if stream:
-            return provider.chat_completion(
-                model_id=model.model_id,
-                messages=full_messages,
-                api_key=model.api_key,
-                base_url=model.base_url,
-                stream=True,
-                **agent.config
-            )
-        
-        # 非流式输出
-        response = await provider.chat_completion(
-            model_id=model.model_id,
-            messages=full_messages,
-            api_key=model.api_key,
-            base_url=model.base_url,
-            stream=False,
-            **agent.config
-        )
-        
-        return response
-    except Exception as e:
-        raise ValueError(f"与模型对话失败: {str(e)}")
+def get_agent_by_api_key(db: Session, api_key: str) -> Optional[Tuple[Agent, str]]:
+    api_key_obj = db.query(AgentApiKey).filter(AgentApiKey.key == api_key).first()
+    if api_key_obj:
+        if not api_key_obj.is_active:
+            return None
+        api_key_obj.usage_count += 1
+        api_key_obj.last_used_at = datetime.now()
+        db.commit()
+        return api_key_obj.agent, api_key_obj.id
+
+    agent = db.query(Agent).filter(
+        Agent.api_key == api_key,
+        Agent.api_enabled == True,
+    ).first()
+    if agent:
+        return agent, "legacy"
+    return None
 
 
-async def test_agent(
-    agent_id: str, 
-    user_id: str, 
-    messages: List[Dict[str, str]],
-    stream: bool = False
-) -> Any:
-    """测试智能体对话（不保存对话历史）"""
-    # 调用相同的对话逻辑，但可以添加一些测试专用的处理
-    return await chat_with_agent(agent_id, user_id, messages, stream=stream) 
+def get_agent_api_keys(db: Session, agent_id: str) -> List[AgentApiKey]:
+    return db.query(AgentApiKey).filter(AgentApiKey.agent_id == agent_id).all()
+
+
+def get_agent_share_tokens(db: Session, agent_id: str) -> List[AgentShareToken]:
+    return db.query(AgentShareToken).filter(AgentShareToken.agent_id == agent_id).all()
