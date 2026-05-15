@@ -19,8 +19,7 @@ from app.schemas.agent import (
     ShareChatRequestBody,
 )
 from app.services import agent_service
-from app.services.agent_access_service import resolve_agent_access
-from app.services.chat_pipeline import ChatPipelineOrchestrator, ChatPipelineRequest
+from app.services.chat_application_service import get_chat_application_service
 from app.utils import format_datetime
 from app.utils.deps import get_current_active_user
 
@@ -202,21 +201,15 @@ async def chat_with_agent(
         user_id,
         chat_request.file_ids,
     )
-    _, resolved_agent_id, access_type = resolve_agent_access(db, agent_id, token)
-    pipeline_request = ChatPipelineRequest(
-        db=db,
-        agent_id=resolved_agent_id,
-        messages=chat_request.messages,
-        session_id=chat_request.session_id or f"session_{int(time.time())}",
-        config_override=chat_request.config or {},
-        file_ids=chat_request.file_ids or [],
-        current_user_id=user_id or "000000",
-        access_type=access_type,
-        share_token=token if access_type == "share" else None,
-    )
     return _build_streaming_response(
         chat_request,
-        ChatPipelineOrchestrator().stream(pipeline_request),
+        get_chat_application_service().stream_chat(
+            db,
+            agent_id,
+            chat_request,
+            share_token=token,
+            current_user_id=user_id or "000000",
+        ),
     )
 
 
@@ -383,20 +376,15 @@ async def chat_with_agent_api(
     if not agent.api_enabled:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="该智能体未启用API访问")
 
-    pipeline_request = ChatPipelineRequest(
-        db=db,
-        agent_id=agent.id,
-        messages=chat_request.messages,
-        session_id=chat_request.session_id or f"session_{int(time.time())}",
-        config_override=chat_request.config or {},
-        file_ids=chat_request.file_ids or [],
-        current_user_id=user_id or "000000",
-        access_type="api",
-        api_key_id=api_key_id,
-    )
     return _build_streaming_response(
         chat_request,
-        ChatPipelineOrchestrator().stream(pipeline_request),
+        get_chat_application_service().stream_chat_for_api_key(
+            db,
+            agent.id,
+            chat_request,
+            api_key_id=api_key_id,
+            current_user_id=user_id or "000000",
+        ),
     )
 
 

@@ -73,6 +73,9 @@ class MemoryManager:
     def add_web_context(self, prompt: str) -> None:
         self.short_term.add({"role": "system", "content": prompt})
 
+    def add_knowledge_context(self, prompt: str) -> None:
+        self.short_term.add({"role": "system", "content": prompt})
+
     def add_history(self, messages: List[Dict[str, str]]) -> None:
         for message in messages:
             self.short_term.add(message)
