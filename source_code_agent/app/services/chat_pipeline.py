@@ -13,8 +13,8 @@ from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
-from app.models.agent import AgentShareToken
 from app.domain.memory import MemoryManager
+from app.repositories.share_token_repository import ShareTokenRepository
 from app.services import agent_service as agent_utils
 from app.services.strategy_base import BaseRetrievalStrategy, StrategyContext
 from app.services.document_context_service import DocumentContextService
@@ -85,12 +85,16 @@ class ChatPipelineOrchestrator:
         response_service: Optional[ChatResponseService] = None,
         graph_service: Optional[GraphRetrievalService] = None,
         strategy_registry: Optional[List[BaseRetrievalStrategy]] = None,
+        share_token_repository_factory: Optional[Any] = None,
     ) -> None:
         self.document_service = document_service or DocumentContextService()
         self.inference_service = inference_service or ModelInferenceService()
         self.mcp_service = mcp_service or McpOrchestrationService()
         self.response_service = response_service or ChatResponseService()
         self.graph_service = graph_service or GraphRetrievalService()
+        self._share_token_repository_factory = (
+            share_token_repository_factory or (lambda db: ShareTokenRepository(db))
+        )
 
         # 策略注册表：通过 is_active(agent) 动态激活，满足开闭原则
         # 传入 strategy_registry 可完整替换，便于测试
@@ -244,13 +248,8 @@ class ChatPipelineOrchestrator:
     async def _run_filter(self, state: ChatPipelineState) -> List[Dict[str, Any]]:
         request = state.request
         if request.access_type == "share" and request.share_token:
-            share_token_obj = (
-                request.db.query(AgentShareToken)
-                .filter(AgentShareToken.token == request.share_token)
-                .first()
-            )
-            if share_token_obj:
-                state.share_token_id = share_token_obj.id
+            share_repo = self._share_token_repository_factory(request.db)
+            state.share_token_id = share_repo.find_id_by_token(request.share_token)
 
         response_time = int((time.time() - state.start_time) * 1000)
         extra_data = self.response_service.build_extra_data(
